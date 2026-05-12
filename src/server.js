@@ -28,29 +28,75 @@ const {
   openAIResponsesToAnthropic,
   streamOpenAIResponsesToAnthropic,
 } = require('./translation/openai-responses-to-anthropic');
+const {
+  buildOpenAIChatCompletionPayloadFromResponses,
+  buildOpenAIResponsesPayloadFromChatCompletion,
+  openAIChatCompletionToResponses,
+  openAIResponsesToChatCompletion,
+  streamOpenAIChatCompletionToResponses,
+  writeChatCompletionAsSse,
+  writeResponsesAsSse,
+} = require('./translation/openai-interop');
 
-const TRANSLATION_TARGETS = new Set(['openai', 'openai_response']);
+const TRANSLATION_PAIRS = new Set([
+  'anthropic|openai',
+  'anthropic|openai_response',
+  'openai|openai_response',
+  'openai_response|openai',
+]);
+const OPENAI_CHAT_COMPLETION_DIALECTS = ['modern', 'hybrid', 'legacy'];
+const openAIChatCompletionDialectCache = new Map();
 
 function isSupportedTranslation(route) {
-  return route?.translation?.source === 'anthropic'
-    && TRANSLATION_TARGETS.has(route?.translation?.target);
+  return TRANSLATION_PAIRS.has(`${route?.translation?.source || ''}|${route?.translation?.target || ''}`);
 }
 
-function getTranslationSpec(target) {
-  switch (target) {
-    case 'openai':
+function getTranslationSpec(source, target) {
+  switch (`${source}|${target}`) {
+    case 'anthropic|openai':
       return {
+        source: 'anthropic',
+        target: 'openai',
+        sourcePath: '/messages',
         targetPath: '/chat/completions',
         buildPayload: buildOpenAIChatCompletionPayload,
-        responseToAnthropic: openAIChatCompletionToAnthropic,
-        streamToAnthropic: streamOpenAIChatCompletionToAnthropic,
+        responseToSource: openAIChatCompletionToAnthropic,
+        streamToSource: streamOpenAIChatCompletionToAnthropic,
+        writeSourceAsSse: writeAnthropicMessageAsSse,
       };
-    case 'openai_response':
+    case 'anthropic|openai_response':
       return {
+        source: 'anthropic',
+        target: 'openai_response',
+        sourcePath: '/messages',
         targetPath: '/responses',
         buildPayload: buildOpenAIResponsesPayload,
-        responseToAnthropic: openAIResponsesToAnthropic,
-        streamToAnthropic: streamOpenAIResponsesToAnthropic,
+        responseToSource: openAIResponsesToAnthropic,
+        streamToSource: streamOpenAIResponsesToAnthropic,
+        writeSourceAsSse: writeAnthropicMessageAsSse,
+      };
+    case 'openai|openai_response':
+      return {
+        source: 'openai',
+        target: 'openai_response',
+        sourcePath: '/chat/completions',
+        targetPath: '/responses',
+        buildPayload: buildOpenAIResponsesPayloadFromChatCompletion,
+        responseToSource: openAIResponsesToChatCompletion,
+        writeSourceAsSse: writeChatCompletionAsSse,
+        forceNonStreamingUpstream: true,
+      };
+    case 'openai_response|openai':
+      return {
+        source: 'openai_response',
+        target: 'openai',
+        sourcePath: '/responses',
+        targetPath: '/chat/completions',
+        buildPayload: buildOpenAIChatCompletionPayloadFromResponses,
+        responseToSource: openAIChatCompletionToResponses,
+        streamToSource: streamOpenAIChatCompletionToResponses,
+        writeSourceAsSse: writeResponsesAsSse,
+        chatCompletionDialect: 'auto',
       };
     default:
       return null;
@@ -69,8 +115,17 @@ function getOpenAIThinkingMode(route, config) {
   return config.openaiThinkingMode;
 }
 
-function isAnthropicMessagesPath(pathname) {
-  return Boolean(splitPathTail(normalizePathname(pathname), '/messages'));
+function getOpenAIChatCompletionToolChoiceMode(route, config) {
+  const configured = config?.openaiChatCompletionToolChoiceMode || 'auto';
+  if (configured !== 'auto') {
+    return configured;
+  }
+
+  if (route?.host && /deepseek\.com$/i.test(route.host)) {
+    return 'message';
+  }
+
+  return 'direct';
 }
 
 function isAnthropicModelsListPath(pathname) {
@@ -93,12 +148,18 @@ function createTranslatedErrorResponse(res, statusCode, message) {
 }
 
 function formatTokenStats(requestTokens, usage) {
-  const inputTokens = usage?.input_tokens ?? requestTokens ?? 0;
-  const outputTokens = usage?.output_tokens ?? 0;
+  const inputTokens = usage?.input_tokens ?? usage?.prompt_tokens ?? requestTokens ?? 0;
+  const outputTokens = usage?.output_tokens ?? usage?.completion_tokens ?? 0;
+  const cachedTokens = usage?.cached_tokens
+    ?? usage?.cache_read_input_tokens
+    ?? usage?.input_tokens_details?.cached_tokens
+    ?? usage?.prompt_tokens_details?.cached_tokens
+    ?? null;
   return {
     requestTokens,
     inputTokens,
     outputTokens,
+    cachedTokens,
     totalTokens: inputTokens + outputTokens,
   };
 }
@@ -108,7 +169,7 @@ function logTokenStats(req, route, targetPath, requestTokens, usage, note = '') 
   const translationTarget = route?.translation?.target || 'anthropic';
   const requestLabel = Number.isFinite(stats.requestTokens) ? `request≈${stats.requestTokens}` : 'request≈unknown';
   const usageLabel = usage
-    ? `input=${stats.inputTokens}, output=${stats.outputTokens}, total=${stats.totalTokens}`
+    ? `input=${stats.inputTokens}, output=${stats.outputTokens}, cached=${stats.cachedTokens ?? 'unknown'}, total=${stats.totalTokens}`
     : 'input/output=unknown';
   const noteLabel = note ? ` ${note}` : '';
 
@@ -122,13 +183,20 @@ function logTokenStatsAscii(req, route, targetPath, requestTokens, usage, note =
   const translationTarget = route?.translation?.target || 'anthropic';
   const requestLabel = Number.isFinite(stats.requestTokens) ? `request~=${stats.requestTokens}` : 'request~=unknown';
   const usageLabel = usage
-    ? `input=${stats.inputTokens}, output=${stats.outputTokens}, total=${stats.totalTokens}`
+    ? `input=${stats.inputTokens}, output=${stats.outputTokens}, cached=${stats.cachedTokens ?? 'unknown'}, total=${stats.totalTokens}`
     : 'input/output=unknown';
   const noteLabel = note ? ` ${note}` : '';
 
   console.log(
     `[Token Stats][${translationTarget}] ${req.method} ${req.originalUrl} -> ${targetPath} ${requestLabel} ${usageLabel}${noteLabel}`,
   );
+}
+
+function logTranslatedTokenStats(req, route, targetPath, requestTokens, payload, usage, note = '') {
+  const upstreamTokens = estimateTokensFromBody(payload || {});
+  const upstreamLabel = Number.isFinite(upstreamTokens) ? `upstream~=${upstreamTokens}` : 'upstream~=unknown';
+  const noteLabel = note ? `${note} ${upstreamLabel}` : upstreamLabel;
+  logTokenStatsAscii(req, route, targetPath, requestTokens, usage, noteLabel);
 }
 
 function attachAbortHandlers(req, res, controller) {
@@ -169,11 +237,11 @@ async function handleTranslatedHeadRequest(req, res, route, config) {
     res.status(response.status).end();
   } catch (error) {
     if (error?.name === 'AbortError' || /aborted/i.test(error?.message || '')) {
-      console.warn(`[Translate Abort] ${req.method} ${req.originalUrl} -> ${targetUrl}`);
+      console.warn(`[Translate Abort] ${req.method} ${req.originalUrl} -> ${targetPath}`);
       return;
     }
 
-    console.error(`[Translate Error] ${req.method} ${req.originalUrl} -> ${targetUrl}: ${error.message}`);
+    console.error(`[Translate Error] ${req.method} ${req.originalUrl} -> ${targetPath}: ${error.message}`);
     if (res.headersSent) {
       return;
     }
@@ -232,93 +300,275 @@ function buildAnthropicErrorFromResponse(responseBody, fallbackMessage) {
   return openAIErrorToAnthropic(responseBody, fallbackMessage);
 }
 
+function buildTranslatedErrorFromResponse(responseBody, fallbackMessage, translationSpec) {
+  if (translationSpec?.source === 'anthropic') {
+    return buildAnthropicErrorFromResponse(responseBody, fallbackMessage);
+  }
+
+  if (typeof responseBody === 'object' && responseBody !== null) {
+    return responseBody;
+  }
+
+  return {
+    error: {
+      type: 'api_error',
+      message: responseBody || fallbackMessage,
+    },
+  };
+}
+
+function buildTranslatedErrorFromException(error, translationSpec) {
+  if (translationSpec?.source === 'anthropic') {
+    return {
+      type: 'error',
+      error: {
+        type: 'api_error',
+        message: error.message,
+      },
+    };
+  }
+
+  return {
+    error: {
+      type: 'api_error',
+      message: error.message,
+    },
+  };
+}
+
+function isOpenAIResponsesToChatCompletions(translationSpec) {
+  return translationSpec?.target === 'openai' && translationSpec?.source === 'openai_response';
+}
+
+function getConfiguredChatCompletionDialect(translationSpec, config) {
+  return config?.openaiChatCompletionDialect || translationSpec?.chatCompletionDialect || 'auto';
+}
+
+function getChatCompletionDialectCacheTtlMs(config) {
+  const ttl = Number(config?.openaiChatCompletionDialectCacheTtlMs);
+  return Number.isFinite(ttl) && ttl > 0 ? ttl : 0;
+}
+
+function getCachedChatCompletionDialect(cacheKey, config, now = Date.now()) {
+  if (!cacheKey || getChatCompletionDialectCacheTtlMs(config) <= 0) {
+    return null;
+  }
+
+  const entry = openAIChatCompletionDialectCache.get(cacheKey);
+  if (!entry) {
+    return null;
+  }
+
+  if (entry.expiresAt <= now || !OPENAI_CHAT_COMPLETION_DIALECTS.includes(entry.dialect)) {
+    openAIChatCompletionDialectCache.delete(cacheKey);
+    return null;
+  }
+
+  return entry.dialect;
+}
+
+function rememberChatCompletionDialect(cacheKey, config, dialect, now = Date.now()) {
+  const ttl = getChatCompletionDialectCacheTtlMs(config);
+  if (!cacheKey || ttl <= 0 || !OPENAI_CHAT_COMPLETION_DIALECTS.includes(dialect)) {
+    return;
+  }
+
+  openAIChatCompletionDialectCache.set(cacheKey, {
+    dialect,
+    expiresAt: now + ttl,
+  });
+}
+
+function clearCachedChatCompletionDialect(cacheKey) {
+  if (cacheKey) {
+    openAIChatCompletionDialectCache.delete(cacheKey);
+  }
+}
+
+function getChatCompletionDialectSequence(translationSpec, config, cacheKey, now = Date.now()) {
+  if (translationSpec?.target !== 'openai' || translationSpec?.source !== 'openai_response') {
+    return [undefined];
+  }
+
+  const configured = getConfiguredChatCompletionDialect(translationSpec, config);
+  if (configured === 'auto') {
+    const cached = getCachedChatCompletionDialect(cacheKey, config, now);
+    if (cached) {
+      return [cached, ...OPENAI_CHAT_COMPLETION_DIALECTS.filter((dialect) => dialect !== cached)];
+    }
+    return [...OPENAI_CHAT_COMPLETION_DIALECTS];
+  }
+
+  return [configured];
+}
+
+function responseBodyContainsToolDialectError(responseBody) {
+  const text = summarizeResponseBody(responseBody, 2000).toLowerCase();
+  if ((text.includes('unknown variant') || text.includes('deserialize'))
+    && text.includes('.role')) {
+    return false;
+  }
+
+  return text.includes('function')
+    || text.includes('tool')
+    || text.includes('tool_calls')
+    || text.includes('function_call')
+    || text.includes('messages[');
+}
+
+function shouldRetryChatCompletionDialect(response, responseBody, dialectIndex, dialects) {
+  if (!Array.isArray(dialects) || dialectIndex >= dialects.length - 1) {
+    return false;
+  }
+
+  if (response?.status !== 400) {
+    return false;
+  }
+
+  return responseBodyContainsToolDialectError(responseBody);
+}
+
 async function handleTranslatedMessagesRequest(req, res, route, config, targetPath, translationSpec) {
   const requestTokens = estimateTokensFromBody(req.body || {});
   // Responses API branch does not preserve reasoning compatibility by design.
-  const preserveReasoningContent = translationSpec.targetPath !== '/responses';
-  const payload = translationSpec.buildPayload(req.body || {}, {
-    model: config.openaiModel || undefined,
-    thinkingMode: getOpenAIThinkingMode(route, config),
-    preserveReasoningContent,
-  });
-
+  const preserveReasoningContent = translationSpec.source === 'anthropic' && translationSpec.targetPath !== '/responses';
   const targetUrl = buildTargetUrl(route, targetPath, '');
+  const dialectCacheKey = isOpenAIResponsesToChatCompletions(translationSpec) ? targetUrl : '';
+  const cachedDialect = getConfiguredChatCompletionDialect(translationSpec, config) === 'auto'
+    ? getCachedChatCompletionDialect(dialectCacheKey, config)
+    : null;
+  const dialects = getChatCompletionDialectSequence(translationSpec, config, dialectCacheKey);
   console.log(`[Translate Fetch] ${req.method} ${req.originalUrl} -> ${targetUrl}`);
-  const headers = buildOpenAIHeaders(req.headers, config, {
-    accept: payload.stream ? 'text/event-stream' : 'application/json',
-  });
+  if (cachedDialect) {
+    console.log(`[Translate Dialect Cache] ${req.method} ${req.originalUrl} -> ${targetUrl}: using cached chat completion dialect ${cachedDialect}`);
+  }
 
   const controller = new AbortController();
   attachAbortHandlers(req, res, controller);
 
   try {
-    const response = await fetch(targetUrl, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify(payload),
-      signal: controller.signal,
-    });
-    const responseContentType = response.headers.get('content-type') || '';
-    console.log(`[Translate Response] ${req.method} ${req.originalUrl} -> Status: ${response.status} Content-Type: ${responseContentType || 'unknown'}`);
+    for (let dialectIndex = 0; dialectIndex < dialects.length; dialectIndex += 1) {
+      const chatCompletionDialect = dialects[dialectIndex];
+      const payload = translationSpec.buildPayload(req.body || {}, {
+        model: config.openaiModel || undefined,
+        thinkingMode: getOpenAIThinkingMode(route, config),
+        preserveReasoningContent,
+        forceNonStreaming: translationSpec.forceNonStreamingUpstream,
+        chatCompletionDialect,
+        toolChoiceMode: getOpenAIChatCompletionToolChoiceMode(route, config),
+      });
+      const headers = buildOpenAIHeaders(req.headers, config, {
+        accept: payload.stream ? 'text/event-stream' : 'application/json',
+      });
 
-    if (!response.ok) {
-      const responseBody = await fetchJsonOrText(response);
-      console.error(`[Translate Error Body] ${req.method} ${req.originalUrl} -> ${targetUrl}: ${summarizeResponseBody(responseBody)}`);
-      const errorBody = buildAnthropicErrorFromResponse(responseBody, 'OpenAI request failed');
-      logTokenStatsAscii(req, route, targetPath, requestTokens, null, `status=${response.status}`);
-      res.status(response.status).json(errorBody);
+      const response = await fetch(targetUrl, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(payload),
+        signal: controller.signal,
+      });
+      const responseContentType = response.headers.get('content-type') || '';
+      const dialectNote = chatCompletionDialect ? ` dialect=${chatCompletionDialect}` : '';
+      console.log(`[Translate Response] ${req.method} ${req.originalUrl} -> Status: ${response.status} Content-Type: ${responseContentType || 'unknown'}${dialectNote}`);
+
+      if (!response.ok) {
+        const responseBody = await fetchJsonOrText(response);
+        console.error(`[Translate Error Body] ${req.method} ${req.originalUrl} -> ${targetUrl}: ${summarizeResponseBody(responseBody)}${dialectNote}`);
+        logTranslatedTokenStats(req, route, targetPath, requestTokens, payload, null, `status=${response.status}${dialectNote}`);
+
+        if (shouldRetryChatCompletionDialect(response, responseBody, dialectIndex, dialects)) {
+          console.warn(`[Translate Retry] ${req.method} ${req.originalUrl} -> ${targetUrl}: retrying chat completion dialect ${dialects[dialectIndex + 1]}`);
+          continue;
+        }
+
+        if (cachedDialect && responseBodyContainsToolDialectError(responseBody)) {
+          clearCachedChatCompletionDialect(dialectCacheKey);
+        }
+
+        const errorBody = buildTranslatedErrorFromResponse(responseBody, 'OpenAI request failed', translationSpec);
+        res.status(response.status).json(errorBody);
+        return;
+      }
+
+      if (getConfiguredChatCompletionDialect(translationSpec, config) === 'auto') {
+        rememberChatCompletionDialect(dialectCacheKey, config, chatCompletionDialect);
+      }
+
+      return handleTranslatedMessagesResponse(req, res, route, targetPath, translationSpec, response, responseContentType, payload, requestTokens, preserveReasoningContent);
+    }
+  } catch (error) {
+    if (error?.name === 'AbortError' || /aborted/i.test(error?.message || '')) {
+      console.warn(`[Translate Abort] ${req.method} ${req.originalUrl} -> ${targetUrl}`);
       return;
     }
 
+    console.error(`[Translate Error] ${req.method} ${req.originalUrl} -> ${targetUrl}: ${error.message}`);
+    if (res.headersSent) {
+      return;
+    }
+
+    res.status(502).json(buildTranslatedErrorFromException(error, translationSpec));
+  }
+}
+
+async function handleTranslatedMessagesResponse(req, res, route, targetPath, translationSpec, response, responseContentType, payload, requestTokens, preserveReasoningContent) {
+  const targetUrl = buildTargetUrl(route, targetPath, '');
+  const sourceRequestedStream = Boolean(req.body?.stream);
+
+  try {
     const contentType = responseContentType;
     if (payload.stream) {
-      if (contentType.includes('text/event-stream')) {
-        const streamUsage = await translationSpec.streamToAnthropic(response, res, {
+      if (contentType.includes('text/event-stream') && translationSpec.streamToSource) {
+        const streamUsage = await translationSpec.streamToSource(response, res, {
           requestModel: payload.model,
           preserveReasoningContent,
         });
-        logTokenStatsAscii(req, route, targetPath, requestTokens, streamUsage, 'stream');
+        logTranslatedTokenStats(req, route, targetPath, requestTokens, payload, streamUsage, 'stream');
         return;
       }
 
       const responseBody = await fetchJsonOrText(response);
       if (typeof responseBody === 'object' && responseBody !== null) {
-        const translated = translationSpec.responseToAnthropic(responseBody, {
+        const translated = translationSpec.responseToSource(responseBody, {
           requestModel: payload.model,
           preserveReasoningContent,
         });
         if (translated?.type === 'error') {
-          logTokenStatsAscii(req, route, targetPath, requestTokens, translated?.usage || null, 'translated-error');
+          logTranslatedTokenStats(req, route, targetPath, requestTokens, payload, translated?.usage || null, 'translated-error');
           res.status(response.status).json(translated);
           return;
         }
 
-        writeAnthropicMessageAsSse(res, translated);
-        logTokenStatsAscii(req, route, targetPath, requestTokens, translated?.usage || null, 'stream-fallback');
+        translationSpec.writeSourceAsSse(res, translated);
+        logTranslatedTokenStats(req, route, targetPath, requestTokens, payload, translated?.usage || null, 'stream-fallback');
         return;
       }
 
-      const errorBody = buildAnthropicErrorFromResponse(responseBody, 'OpenAI request failed');
-      logTokenStatsAscii(req, route, targetPath, requestTokens, null, `status=${response.status}`);
+      const errorBody = buildTranslatedErrorFromResponse(responseBody, 'OpenAI request failed', translationSpec);
+      logTranslatedTokenStats(req, route, targetPath, requestTokens, payload, null, `status=${response.status}`);
       res.status(response.status).json(errorBody);
       return;
     }
 
-    if (contentType.includes('text/event-stream')) {
-      const streamUsage = await translationSpec.streamToAnthropic(response, res, {
+    if (contentType.includes('text/event-stream') && translationSpec.streamToSource) {
+      const streamUsage = await translationSpec.streamToSource(response, res, {
         requestModel: payload.model,
         preserveReasoningContent,
       });
-      logTokenStatsAscii(req, route, targetPath, requestTokens, streamUsage, 'stream');
+      logTranslatedTokenStats(req, route, targetPath, requestTokens, payload, streamUsage, 'stream');
       return;
     }
 
     const responseJson = await response.json();
-    const translated = translationSpec.responseToAnthropic(responseJson, {
+    const translated = translationSpec.responseToSource(responseJson, {
       requestModel: payload.model,
       preserveReasoningContent,
     });
-    logTokenStatsAscii(req, route, targetPath, requestTokens, translated?.usage || null, translated?.type === 'error' ? 'translated-error' : 'translated');
+    logTranslatedTokenStats(req, route, targetPath, requestTokens, payload, translated?.usage || null, translated?.type === 'error' ? 'translated-error' : 'translated');
+    if (sourceRequestedStream && translationSpec.writeSourceAsSse) {
+      translationSpec.writeSourceAsSse(res, translated);
+      return;
+    }
     res.status(response.status).json(translated);
   } catch (error) {
     if (error?.name === 'AbortError' || /aborted/i.test(error?.message || '')) {
@@ -331,13 +581,7 @@ async function handleTranslatedMessagesRequest(req, res, route, config, targetPa
       return;
     }
 
-    res.status(502).json({
-      type: 'error',
-      error: {
-        type: 'api_error',
-        message: error.message,
-      },
-    });
+    res.status(502).json(buildTranslatedErrorFromException(error, translationSpec));
   }
 }
 
@@ -410,7 +654,7 @@ async function handleTranslationMiddleware(req, res, next) {
     );
   }
 
-  const translationSpec = getTranslationSpec(route.translation.target);
+  const translationSpec = getTranslationSpec(route.translation.source, route.translation.target);
   if (!translationSpec) {
     return createTranslatedErrorResponse(
       res,
@@ -434,8 +678,8 @@ async function handleTranslationMiddleware(req, res, next) {
 
   const normalizedPath = normalizePathname(route.upstreamPath);
 
-  if (req.method === 'POST' && isAnthropicMessagesPath(normalizedPath)) {
-    const targetPath = translatePathTail(normalizedPath, '/messages', translationSpec.targetPath);
+  if (req.method === 'POST' && splitPathTail(normalizedPath, translationSpec.sourcePath)) {
+    const targetPath = translatePathTail(normalizedPath, translationSpec.sourcePath, translationSpec.targetPath);
     if (targetPath) {
       console.log(`[Translate] ${req.method} ${req.originalUrl} -> ${targetPath}`);
       return handleTranslatedMessagesRequest(
@@ -449,7 +693,7 @@ async function handleTranslationMiddleware(req, res, next) {
     }
   }
 
-  if (req.method === 'GET' && isAnthropicModelsListPath(normalizedPath)) {
+  if (translationSpec.source === 'anthropic' && req.method === 'GET' && isAnthropicModelsListPath(normalizedPath)) {
     const targetPath = translatePathTail(normalizedPath, '/models', '/models');
     if (targetPath) {
       console.log(`[Translate] ${req.method} ${req.originalUrl} -> ${targetPath}`);
@@ -458,7 +702,7 @@ async function handleTranslationMiddleware(req, res, next) {
   }
 
   const detailMatch = getAnthropicModelDetailMatch(normalizedPath);
-  if (req.method === 'GET' && detailMatch) {
+  if (translationSpec.source === 'anthropic' && req.method === 'GET' && detailMatch) {
     const targetPath = translatePathTail(normalizedPath, `/models/${detailMatch[2]}`, `/models/${detailMatch[2]}`);
     if (targetPath) {
       console.log(`[Translate] ${req.method} ${req.originalUrl} -> ${targetPath}`);
@@ -482,7 +726,7 @@ function createApp(config = getConfig()) {
         routes: {
           direct: '/<host>/<path>',
           secure: '/s/<host>/<path>',
-          translated: '/<host>/<base>/$anthropic|openai|openai_response/<path>',
+          translated: '/<host>/<base>/$anthropic|openai|openai_response or $openai|openai_response or $openai_response|openai/<path>',
         },
       });
       return;
@@ -597,7 +841,7 @@ function startServer(config = getConfig()) {
     console.log(`Listening on: http://localhost:${config.port}`);
     console.log(`Body limit: ${config.bodyLimit}`);
     console.log('Direct routing: /<host>/<path> or /s/<host>/<path>');
-    console.log('Translated routing: /<host>/<base>/$anthropic|openai|openai_response/<path>');
+    console.log('Translated routing: /<host>/<base>/$anthropic|openai|openai_response or $openai|openai_response or $openai_response|openai/<path>');
     console.log('-----------------------------------------');
   });
   return app;
@@ -605,5 +849,10 @@ function startServer(config = getConfig()) {
 
 module.exports = {
   createApp,
+  clearCachedChatCompletionDialect,
+  getCachedChatCompletionDialect,
+  getChatCompletionDialectSequence,
+  openAIChatCompletionDialectCache,
+  rememberChatCompletionDialect,
   startServer,
 };

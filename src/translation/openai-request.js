@@ -45,6 +45,10 @@ function buildOpenAIHeaders(reqHeaders, config, extraHeaders = {}) {
     headers.set('authorization', authorization);
   }
 
+  if (config?.overwriteUserAgent) {
+    headers.set('user-agent', String(config.overwriteUserAgent));
+  }
+
   headers.set('content-type', 'application/json');
 
   for (const [key, value] of Object.entries(extraHeaders)) {

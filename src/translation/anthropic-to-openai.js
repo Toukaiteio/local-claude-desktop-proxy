@@ -137,6 +137,16 @@ function buildToolChoice(toolChoice) {
   return undefined;
 }
 
+function toOpenAIToolCallId(index = 0) {
+  return `call_${index}`;
+}
+
+function toOpenAIFallbackToolCallId(state) {
+  const index = state.nextSyntheticCallIndex || 0;
+  state.nextSyntheticCallIndex = index + 1;
+  return `call_orphan_${index}`;
+}
+
 function normalizeThinkingPayload(thinking, overrideMode) {
   if (overrideMode === 'enabled' || overrideMode === 'disabled') {
     return { type: overrideMode };
@@ -170,6 +180,71 @@ function normalizeThinkingPayload(thinking, overrideMode) {
     }
     if (type === 'source' || type === 'auto') {
       return undefined;
+    }
+  }
+
+  return undefined;
+}
+
+function normalizeOpenAIReasoningEffort(value) {
+  const normalized = typeof value === 'string' ? value.trim().toLowerCase() : '';
+
+  switch (normalized) {
+    case 'none':
+    case 'minimal':
+    case 'low':
+    case 'medium':
+    case 'high':
+    case 'xhigh':
+      return normalized;
+    case 'max':
+      return 'xhigh';
+    default:
+      return undefined;
+  }
+}
+
+function buildReasoningEffortPayload(anthropicBody, options = {}) {
+  if (options.thinkingMode === 'enabled') {
+    return 'high';
+  }
+
+  if (options.thinkingMode === 'disabled') {
+    return 'none';
+  }
+
+  const explicitEffort = normalizeOpenAIReasoningEffort(
+    anthropicBody?.output_config?.effort
+      ?? anthropicBody?.thinking?.effort
+      ?? options.reasoningEffort,
+  );
+  if (explicitEffort) {
+    return explicitEffort;
+  }
+
+  const thinking = anthropicBody?.thinking;
+  if (thinking && typeof thinking === 'object') {
+    const type = typeof thinking.type === 'string' ? thinking.type.trim().toLowerCase() : '';
+    if (type === 'disabled') {
+      return 'none';
+    }
+
+    if (type === 'enabled' || type === 'adaptive') {
+      return 'high';
+    }
+  }
+
+  if (typeof thinking === 'boolean') {
+    return thinking ? 'high' : 'none';
+  }
+
+  if (typeof thinking === 'string') {
+    const normalized = thinking.trim().toLowerCase();
+    if (normalized === 'enabled') {
+      return 'high';
+    }
+    if (normalized === 'disabled') {
+      return 'none';
     }
   }
 
@@ -217,7 +292,7 @@ function buildTools(tools) {
   return mapped.length > 0 ? mapped : undefined;
 }
 
-function convertUserMessage(message) {
+function convertUserMessage(message, state = {}) {
   const blocks = normalizeContent(message.content);
   const openAIValues = [];
   const messages = [];
@@ -238,9 +313,13 @@ function convertUserMessage(message) {
   for (const block of blocks) {
     if (block && typeof block === 'object' && block.type === 'tool_result') {
       flushUserMessage();
+      const sourceToolUseId = String(block.tool_use_id || block.id || '');
+      const mappedToolCallId = state.toolCallIdMap?.get(sourceToolUseId)
+        || state.toolCallIdMap?.get(String(block.id || ''))
+        || null;
       messages.push({
         role: 'tool',
-        tool_call_id: String(block.tool_use_id || block.id || ''),
+        tool_call_id: mappedToolCallId || toOpenAIFallbackToolCallId(state),
         content: buildToolResultContent(block.content),
       });
       continue;
@@ -268,7 +347,7 @@ function convertUserMessage(message) {
   return messages;
 }
 
-function convertAssistantMessage(message, options = {}) {
+function convertAssistantMessage(message, state = {}, options = {}) {
   const blocks = normalizeContent(message.content);
   const textParts = [];
   const toolCalls = [];
@@ -287,8 +366,17 @@ function convertAssistantMessage(message, options = {}) {
     }
 
     if (block.type === 'tool_use') {
+      const sourceToolUseId = String(block.id || `toolu_${state.nextToolCallIndex || 0}`);
+      const toolCallId = toOpenAIToolCallId(state.nextToolCallIndex || 0);
+      state.nextToolCallIndex = (state.nextToolCallIndex || 0) + 1;
+      if (state.toolCallIdMap) {
+        state.toolCallIdMap.set(sourceToolUseId, toolCallId);
+        if (block.id && block.id !== sourceToolUseId) {
+          state.toolCallIdMap.set(String(block.id), toolCallId);
+        }
+      }
       toolCalls.push({
-        id: block.id,
+        id: toolCallId,
         type: 'function',
         function: {
           name: block.name || `tool_${toolCalls.length}`,
@@ -329,17 +417,17 @@ function convertAssistantMessage(message, options = {}) {
   return [assistantMessage];
 }
 
-function convertMessage(message, options = {}) {
+function convertMessage(message, state = {}, options = {}) {
   if (!message || typeof message !== 'object') {
     return [];
   }
 
   if (message.role === 'user') {
-    return convertUserMessage(message);
+    return convertUserMessage(message, state);
   }
 
   if (message.role === 'assistant') {
-    return convertAssistantMessage(message, options);
+    return convertAssistantMessage(message, state, options);
   }
 
   if (message.role === 'system') {
@@ -355,6 +443,11 @@ function convertMessage(message, options = {}) {
 
 function buildOpenAIChatCompletionPayload(anthropicBody, options = {}) {
   const payload = {};
+  const state = {
+    toolCallIdMap: new Map(),
+    nextToolCallIndex: 0,
+    nextSyntheticCallIndex: 0,
+  };
 
   const resolvedModel = options.model || anthropicBody?.model;
   if (resolvedModel) {
@@ -373,13 +466,18 @@ function buildOpenAIChatCompletionPayload(anthropicBody, options = {}) {
   }
 
   for (const message of Array.isArray(anthropicBody?.messages) ? anthropicBody.messages : []) {
-    messages.push(...convertMessage(message, options));
+    messages.push(...convertMessage(message, state, options));
   }
   payload.messages = messages;
 
   const thinkingPayload = normalizeThinkingPayload(anthropicBody?.thinking, options.thinkingMode);
   if (thinkingPayload) {
     payload.thinking = thinkingPayload;
+  }
+
+  const reasoningEffort = buildReasoningEffortPayload(anthropicBody, options);
+  if (reasoningEffort) {
+    payload.reasoning_effort = reasoningEffort;
   }
 
   const copyFields = [
@@ -390,12 +488,21 @@ function buildOpenAIChatCompletionPayload(anthropicBody, options = {}) {
     'response_format',
     'logprobs',
     'top_logprobs',
+    'metadata',
+    'prompt_cache_key',
+    'prompt_cache_retention',
   ];
 
   for (const field of copyFields) {
     if (anthropicBody?.[field] !== undefined) {
       payload[field] = anthropicBody[field];
     }
+  }
+
+  if (anthropicBody?.safety_identifier !== undefined) {
+    payload.safety_identifier = anthropicBody.safety_identifier;
+  } else if (anthropicBody?.user !== undefined) {
+    payload.safety_identifier = anthropicBody.user;
   }
 
   if (anthropicBody?.max_tokens !== undefined) {

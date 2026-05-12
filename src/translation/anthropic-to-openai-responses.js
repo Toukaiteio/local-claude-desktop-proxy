@@ -149,23 +149,82 @@ function buildToolChoice(toolChoice) {
   return undefined;
 }
 
-function stripKnownToolPrefixes(value) {
-  return String(value || '').replace(/^(?:fc_|call_|toolu_)/, '');
+function normalizeOpenAIResponsesReasoningEffort(value) {
+  const normalized = typeof value === 'string' ? value.trim().toLowerCase() : '';
+
+  switch (normalized) {
+    case 'none':
+    case 'minimal':
+    case 'low':
+    case 'medium':
+    case 'high':
+    case 'xhigh':
+      return normalized;
+    case 'max':
+      return 'xhigh';
+    default:
+      return undefined;
+  }
 }
 
-function sanitizeResponsesToolId(value, fallback) {
-  const base = typeof value === 'string' && value.trim() ? value.trim() : fallback;
-  const stripped = stripKnownToolPrefixes(base);
-  const normalized = stripped.replace(/[^a-zA-Z0-9_-]/g, '_');
-  return normalized || fallback;
+function buildResponsesReasoningPayload(anthropicBody, options = {}) {
+  const explicitReasoning = anthropicBody?.reasoning;
+  if (explicitReasoning && typeof explicitReasoning === 'object' && !Array.isArray(explicitReasoning)) {
+    const reasoningPayload = { ...explicitReasoning };
+    if (reasoningPayload.effort !== undefined) {
+      const normalizedEffort = normalizeOpenAIResponsesReasoningEffort(reasoningPayload.effort);
+      if (normalizedEffort) {
+        reasoningPayload.effort = normalizedEffort;
+      } else {
+        delete reasoningPayload.effort;
+      }
+    }
+
+    if (Object.keys(reasoningPayload).length > 0) {
+      return reasoningPayload;
+    }
+  }
+
+  const explicitEffort = normalizeOpenAIResponsesReasoningEffort(
+    anthropicBody?.output_config?.effort
+      ?? anthropicBody?.effort
+      ?? options.reasoningEffort,
+  );
+  if (explicitEffort) {
+    return { effort: explicitEffort };
+  }
+
+  const thinking = anthropicBody?.thinking;
+  if (thinking && typeof thinking === 'object') {
+    const thinkingType = typeof thinking.type === 'string' ? thinking.type.trim().toLowerCase() : '';
+    if (thinkingType === 'disabled') {
+      return { effort: 'none' };
+    }
+
+    const thinkingEffort = normalizeOpenAIResponsesReasoningEffort(thinking.effort);
+    if (thinkingEffort) {
+      return { effort: thinkingEffort };
+    }
+
+    if (thinkingType === 'enabled' || thinkingType === 'adaptive') {
+      return { effort: 'high' };
+    }
+  }
+
+  return undefined;
 }
 
-function toResponsesFunctionCallIds(sourceId, index = 0) {
-  const normalized = sanitizeResponsesToolId(sourceId, `tool_${index}`);
+function toResponsesFunctionCallIds(index = 0) {
   return {
-    id: `fc_${normalized}`,
-    callId: `call_${normalized}`,
+    id: `fc_${index}`,
+    callId: `call_${index}`,
   };
+}
+
+function toResponsesFallbackCallId(state) {
+  const index = state.nextSyntheticCallIndex || 0;
+  state.nextSyntheticCallIndex = index + 1;
+  return `call_orphan_${index}`;
 }
 
 function extractReasoningContentFromBlocks(blocks) {
@@ -245,7 +304,7 @@ function convertUserMessage(message, state = {}, options = {}) {
         || null;
       inputItems.push({
         type: 'function_call_output',
-        call_id: mappedCallId || toResponsesFunctionCallIds(sourceToolUseId, inputItems.length).callId,
+        call_id: mappedCallId || toResponsesFallbackCallId(state),
         output: buildToolResultContent(block.content),
       });
       continue;
@@ -310,10 +369,14 @@ function convertAssistantMessage(message, state = {}, options = {}) {
   for (const block of blocks) {
     if (block && typeof block === 'object' && block.type === 'tool_use') {
       flushAssistantMessage();
-      const callId = String(block.id || `toolu_${inputItems.length}`);
-      const responsesIds = toResponsesFunctionCallIds(callId, inputItems.length);
+      const callId = String(block.id || `toolu_${state.nextToolCallIndex || 0}`);
+      const responsesIds = toResponsesFunctionCallIds(state.nextToolCallIndex || 0);
+      state.nextToolCallIndex = (state.nextToolCallIndex || 0) + 1;
       if (state.toolCallIdMap) {
         state.toolCallIdMap.set(callId, responsesIds.callId);
+        if (block.id && block.id !== callId) {
+          state.toolCallIdMap.set(String(block.id), responsesIds.callId);
+        }
       }
       inputItems.push({
         type: 'function_call',
@@ -394,7 +457,7 @@ function convertToolMessage(message, state = {}, options = {}) {
     || null;
   return [{
     type: 'function_call_output',
-    call_id: mappedCallId || toResponsesFunctionCallIds(sourceToolUseId).callId,
+    call_id: mappedCallId || toResponsesFallbackCallId(state),
     output: buildToolResultContent(message?.content),
   }];
 }
@@ -427,6 +490,8 @@ function buildOpenAIResponsesPayload(anthropicBody, options = {}) {
   const payload = {};
   const state = {
     toolCallIdMap: new Map(),
+    nextToolCallIndex: 0,
+    nextSyntheticCallIndex: 0,
   };
   const preserveReasoningContent = options.preserveReasoningContent !== false;
 
@@ -460,16 +525,25 @@ function buildOpenAIResponsesPayload(anthropicBody, options = {}) {
     'background',
     'prompt_cache_key',
     'prompt_cache_retention',
-    'reasoning',
     'text',
     'truncation',
-    'user',
   ];
 
   for (const field of copyFields) {
     if (anthropicBody?.[field] !== undefined) {
       payload[field] = anthropicBody[field];
     }
+  }
+
+  if (anthropicBody?.safety_identifier !== undefined) {
+    payload.safety_identifier = anthropicBody.safety_identifier;
+  } else if (anthropicBody?.user !== undefined) {
+    payload.safety_identifier = anthropicBody.user;
+  }
+
+  const reasoningPayload = buildResponsesReasoningPayload(anthropicBody, options);
+  if (reasoningPayload) {
+    payload.reasoning = reasoningPayload;
   }
 
   if (anthropicBody?.max_tokens !== undefined) {

@@ -48,11 +48,66 @@ function buildThinkingBlock(reasoningContent, signature = '') {
   };
 }
 
+function buildToolUseBlock(toolCall, index = 0) {
+  return {
+    type: 'tool_use',
+    id: toAnthropicToolUseId(toolCall?.id, index),
+    name: toolCall?.function?.name || toolCall?.name || `tool_${index}`,
+    input: safeJsonParse(toolCall?.function?.arguments || toolCall?.arguments || '') ?? {},
+  };
+}
+
+function extractReasoningFromOpenAIContent(content) {
+  if (!Array.isArray(content)) {
+    return '';
+  }
+
+  const parts = [];
+  for (const part of content) {
+    if (!part || typeof part !== 'object') {
+      continue;
+    }
+
+    if (part.type === 'reasoning' || part.type === 'thinking' || part.type === 'reasoning_summary') {
+      if (typeof part.reasoning === 'string' && part.reasoning.trim() !== '') {
+        parts.push(part.reasoning);
+        continue;
+      }
+
+      if (typeof part.thinking === 'string' && part.thinking.trim() !== '') {
+        parts.push(part.thinking);
+        continue;
+      }
+
+      if (typeof part.summary === 'string' && part.summary.trim() !== '') {
+        parts.push(part.summary);
+        continue;
+      }
+
+      if (typeof part.text === 'string' && part.text.trim() !== '') {
+        parts.push(part.text);
+      }
+      continue;
+    }
+
+    if (part.type === 'summary_text' && typeof part.text === 'string' && part.text.trim() !== '') {
+      parts.push(part.text);
+      continue;
+    }
+
+    if (part.type === 'redacted_thinking' && typeof part.data === 'string' && part.data.trim() !== '') {
+      parts.push(part.data);
+    }
+  }
+
+  return parts.join('');
+}
+
 function openAIMessageToAnthropicContent(message) {
   const content = [];
-  const reasoningContent = typeof message?.reasoning_content === 'string'
+  const reasoningContent = typeof message?.reasoning_content === 'string' && message.reasoning_content.trim() !== ''
     ? message.reasoning_content
-    : '';
+    : extractReasoningFromOpenAIContent(message?.content);
 
   if (reasoningContent) {
     content.push(buildThinkingBlock(reasoningContent));
@@ -67,14 +122,21 @@ function openAIMessageToAnthropicContent(message) {
   }
 
   const toolCalls = Array.isArray(message?.tool_calls) ? message.tool_calls : [];
-  toolCalls.forEach((toolCall, index) => {
-    content.push({
-      type: 'tool_use',
-      id: toAnthropicToolUseId(toolCall?.id, index),
-      name: toolCall?.function?.name || `tool_${index}`,
-      input: safeJsonParse(toolCall?.function?.arguments || '') ?? {},
+  if (toolCalls.length > 0) {
+    toolCalls.forEach((toolCall, index) => {
+      content.push(buildToolUseBlock(toolCall, index));
     });
-  });
+  } else if (message?.function_call && typeof message.function_call === 'object') {
+    content.push(buildToolUseBlock({
+      id: message.function_call.id,
+      name: message.function_call.name,
+      arguments: message.function_call.arguments,
+      function: {
+        name: message.function_call.name,
+        arguments: message.function_call.arguments,
+      },
+    }));
+  }
 
   return content;
 }
@@ -82,9 +144,9 @@ function openAIMessageToAnthropicContent(message) {
 function openAIChatCompletionToAnthropic(response, context = {}) {
   const choice = Array.isArray(response?.choices) ? response.choices[0] : null;
   const message = choice?.message || {};
-  const reasoningContent = typeof message?.reasoning_content === 'string'
+  const reasoningContent = typeof message?.reasoning_content === 'string' && message.reasoning_content.trim() !== ''
     ? message.reasoning_content
-    : '';
+    : extractReasoningFromOpenAIContent(message?.content);
   return {
     id: toAnthropicMessageId(response?.id),
     type: 'message',
@@ -453,6 +515,17 @@ async function streamOpenAIChatCompletionToAnthropic(openAIResponse, res, contex
     return block;
   };
 
+  const appendLegacyFunctionCall = (functionCall) => {
+    if (!functionCall || typeof functionCall !== 'object') return;
+    appendToolCalls([{
+      id: functionCall.id,
+      function: {
+        name: functionCall.name,
+        arguments: functionCall.arguments || '',
+      },
+    }]);
+  };
+
   const appendTextDelta = (text) => {
     if (!text) return;
     ensureMessageStarted();
@@ -551,6 +624,8 @@ async function streamOpenAIChatCompletionToAnthropic(openAIResponse, res, contex
 
       if (Array.isArray(delta.tool_calls) && delta.tool_calls.length > 0) {
         appendToolCalls(delta.tool_calls);
+      } else if (delta.function_call && typeof delta.function_call === 'object') {
+        appendLegacyFunctionCall(delta.function_call);
       }
 
       if (choice.finish_reason) {

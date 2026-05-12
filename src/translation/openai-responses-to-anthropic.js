@@ -10,9 +10,16 @@ const {
 } = require('./utils');
 
 function mapResponsesUsageToAnthropic(usage) {
+  const cachedTokens = usage?.input_tokens_details?.cached_tokens
+    ?? usage?.prompt_tokens_details?.cached_tokens
+    ?? usage?.cached_tokens;
   return {
     input_tokens: usage?.input_tokens ?? 0,
     output_tokens: usage?.output_tokens ?? 0,
+    ...(cachedTokens != null ? {
+      cached_tokens: cachedTokens,
+      cache_read_input_tokens: cachedTokens,
+    } : {}),
   };
 }
 
@@ -76,8 +83,57 @@ function extractReasoningFromOutputContent(content) {
       continue;
     }
 
+    if (part.type === 'summary_text' && typeof part.text === 'string' && part.text.trim() !== '') {
+      parts.push(part.text);
+      continue;
+    }
+
     if (part.type === 'redacted_thinking' && typeof part.data === 'string' && part.data.trim() !== '') {
       parts.push(part.data);
+    }
+  }
+
+  return parts.join('');
+}
+
+function extractReasoningFromSummary(summary) {
+  if (typeof summary === 'string') {
+    return summary;
+  }
+
+  if (!Array.isArray(summary)) {
+    return '';
+  }
+
+  const parts = [];
+  for (const part of summary) {
+    if (!part) {
+      continue;
+    }
+
+    if (typeof part === 'string') {
+      if (part.trim() !== '') {
+        parts.push(part);
+      }
+      continue;
+    }
+
+    if (typeof part !== 'object') {
+      continue;
+    }
+
+    if (typeof part.text === 'string' && part.text.trim() !== '') {
+      parts.push(part.text);
+      continue;
+    }
+
+    if (typeof part.reasoning === 'string' && part.reasoning.trim() !== '') {
+      parts.push(part.reasoning);
+      continue;
+    }
+
+    if (typeof part.thinking === 'string' && part.thinking.trim() !== '') {
+      parts.push(part.thinking);
     }
   }
 
@@ -99,6 +155,16 @@ function extractReasoningFromOutputItem(item) {
 
   if (typeof item.summary === 'string' && item.summary.trim() !== '') {
     return item.summary;
+  }
+
+  const contentReasoning = extractReasoningFromOutputContent(item.content);
+  if (contentReasoning) {
+    return contentReasoning;
+  }
+
+  const summaryReasoning = extractReasoningFromSummary(item.summary);
+  if (summaryReasoning) {
+    return summaryReasoning;
   }
 
   if (item.type === 'message') {
@@ -648,6 +714,7 @@ function extractReasoningDeltaText(delta) {
   if (typeof delta.reasoning === 'string') return delta.reasoning;
   if (typeof delta.thinking === 'string') return delta.thinking;
   if (typeof delta.summary === 'string') return delta.summary;
+  if (Array.isArray(delta.summary)) return extractReasoningFromSummary(delta.summary);
   if (typeof delta.text === 'string') return delta.text;
   return '';
 }
@@ -893,12 +960,13 @@ async function streamOpenAIResponsesToAnthropic(openAIResponse, res, context = {
       }
     }
 
-    return finalizeResponseStream(state, res, state.latestResponse || {
+    const finalResponse = state.latestResponse || {
       id: openAIResponse?.id,
       model: state.model,
       usage: state.latestUsage,
       output: [],
-    }, {
+    };
+    return finalizeResponseStream(state, res, finalResponse, {
       preserveReasoningContent,
     });
   } catch (error) {

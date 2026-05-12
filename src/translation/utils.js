@@ -64,6 +64,7 @@ function mapFinishReason(reason) {
     case 'length':
       return 'max_tokens';
     case 'tool_calls':
+    case 'function_call':
       return 'tool_use';
     case 'content_filter':
       return 'end_turn';
@@ -73,9 +74,16 @@ function mapFinishReason(reason) {
 }
 
 function mapUsage(usage) {
+  const cachedTokens = usage?.prompt_tokens_details?.cached_tokens
+    ?? usage?.input_tokens_details?.cached_tokens
+    ?? usage?.cached_tokens;
   return {
     input_tokens: usage?.prompt_tokens ?? 0,
     output_tokens: usage?.completion_tokens ?? 0,
+    ...(cachedTokens != null ? {
+      cached_tokens: cachedTokens,
+      cache_read_input_tokens: cachedTokens,
+    } : {}),
   };
 }
 
