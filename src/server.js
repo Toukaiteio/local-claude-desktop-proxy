@@ -755,9 +755,10 @@ function createApp(config = getConfig()) {
   app.use((req, res, next) => {
     if (req.body && req.body.model) {
       const oldModel = req.body.model;
-      const newModel = rewriteModelName(oldModel, req.headers);
+      const rewriteRules = req.proxyRoute?.rewriteRules || [];
+      const newModel = rewriteModelName(oldModel, req.headers, rewriteRules);
       if (oldModel !== newModel) {
-        console.log(`[Model Rewrite] ${oldModel} -> ${newModel}`);
+        console.log(`[Model Rewrite] ${oldModel} -> ${newModel} (rules: ${rewriteRules.join(', ')})`);
         req.body.model = newModel;
       }
     }

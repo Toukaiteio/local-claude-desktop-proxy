@@ -12,6 +12,19 @@ function safeDecodeURIComponent(value) {
   }
 }
 
+function parseRewriteRules(segment) {
+  if (typeof segment !== 'string') return null;
+  const decoded = safeDecodeURIComponent(segment);
+  const match = decoded.match(/^<(.*)>$/);
+  if (match) {
+    return {
+      raw: segment,
+      rules: match[1].split(',').map((r) => r.trim()).filter(Boolean),
+    };
+  }
+  return null;
+}
+
 function parseTranslationSuffix(segment) {
   if (typeof segment !== 'string' || segment.length === 0) {
     return null;
@@ -54,7 +67,21 @@ function parseProxyRequestUrl(originalUrl) {
   }
 
   const url = new URL(originalUrl, 'http://proxy.local');
-  const segments = url.pathname.split('/').filter(Boolean);
+  let segments = url.pathname.split('/').filter(Boolean);
+  if (segments.length === 0) {
+    return null;
+  }
+
+  const rewriteRules = [];
+  segments = segments.filter((segment) => {
+    const parsed = parseRewriteRules(segment);
+    if (parsed) {
+      rewriteRules.push(...parsed.rules);
+      return false;
+    }
+    return true;
+  });
+
   if (segments.length === 0) {
     return null;
   }
@@ -125,6 +152,7 @@ function parseProxyRequestUrl(originalUrl) {
     upstreamPath: upstreamSegments.length > 0 ? `/${upstreamSegments.join('/')}` : '/',
     translation,
     hasTranslation: Boolean(translation),
+    rewriteRules,
   };
 }
 

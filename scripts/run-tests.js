@@ -1556,8 +1556,19 @@ test('parses a simple SSE stream', async () => {
   assert.equal(events[0].data, '{"hello":1}');
 });
 
+const { runRewriteTests } = require('../test/rewrite.test');
+
 async function main() {
   let failed = 0;
+
+  try {
+    runRewriteTests();
+  } catch (error) {
+    console.error('rewriteModelName tests failed!');
+    console.error(error);
+    process.exitCode = 1;
+    return;
+  }
 
   for (const { name, fn } of tests) {
     try {

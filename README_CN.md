@@ -43,6 +43,21 @@ $anthropic|openai_response
 - `anthropic/<model>*<provider>` -> `<provider>/<model>`
 - `anthropic/<model>*` -> `<model>`
 
+### 模型名转换规则 (通过 URL)
+
+你可以在 URL 中通过 `<>` 包裹转换规则，并使用半角逗号分隔。这些路径片段会被代理识别并从最终请求路径中剥离。
+
+- **精确覆写 (`$$`)**: `pattern$$target`。如果模型名完全匹配 `pattern`，则改为 `target`。
+  - 示例 URL: `/<host>/<gpt-4o$$gpt-4o-mini>/v1/messages`
+- **模糊覆写 (`||`)**: `pattern||target`。如果模型名包含 `pattern`，则整体覆写为 `target`。
+  - 示例 URL: `/<host>/<gpt-4||gpt-4o>/v1/messages`
+- **模糊替换 (`##`)**: `pattern##replacement`。将模型名中的 `pattern` 替换为 `replacement`。
+  - 示例 URL: `/<host>/<gpt-4##gpt-4o>/v1/messages`
+- **匿名覆写**: `$$target`。无条件将模型名改为 `target`。
+  - 示例 URL: `/<host>/<$$gpt-4o-mini>/v1/messages`
+
+可以同时提供多个规则: `/<host>/<gpt-4##gpt-4o, gpt-4o-turbo$$success>/v1/messages`。规则会按顺序应用于 `<model>` 部分，并保留 `anthropic/` 和 `*provider` 的逻辑。
+
 特殊 header：
 
 - `x-remove-ai-provider: true`
