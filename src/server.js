@@ -34,13 +34,18 @@ const {
   openAIChatCompletionToResponses,
   openAIResponsesToChatCompletion,
   streamOpenAIChatCompletionToResponses,
+  streamOpenAIChatCompletionToOpenAI,
   writeChatCompletionAsSse,
   writeResponsesAsSse,
 } = require('./translation/openai-interop');
+const {
+  fixOpenAIChatCompletionPayload,
+} = require('./translation/openai-fixer');
 
 const TRANSLATION_PAIRS = new Set([
   'anthropic|openai',
   'anthropic|openai_response',
+  'openai|openai',
   'openai|openai_response',
   'openai_response|openai',
 ]);
@@ -98,13 +103,24 @@ function getTranslationSpec(source, target) {
         writeSourceAsSse: writeResponsesAsSse,
         chatCompletionDialect: 'auto',
       };
+    case 'openai|openai':
+      return {
+        source: 'openai',
+        target: 'openai',
+        sourcePath: '/chat/completions',
+        targetPath: '/chat/completions',
+        buildPayload: fixOpenAIChatCompletionPayload,
+        responseToSource: (res) => res,
+        streamToSource: streamOpenAIChatCompletionToOpenAI,
+        writeSourceAsSse: writeChatCompletionAsSse,
+      };
     default:
       return null;
   }
 }
 
 function getOpenAIThinkingMode(route, config) {
-  if (!route?.host || !/deepseek\.com$/i.test(route.host)) {
+  if (!route?.host || (!/deepseek\.com$/i.test(route.host) && !/opencode\.ai$/i.test(route.host))) {
     return undefined;
   }
 
@@ -121,7 +137,7 @@ function getOpenAIChatCompletionToolChoiceMode(route, config) {
     return configured;
   }
 
-  if (route?.host && /deepseek\.com$/i.test(route.host)) {
+  if (route?.host && (/deepseek\.com$/i.test(route.host) || /opencode\.ai$/i.test(route.host))) {
     return 'message';
   }
 
@@ -181,22 +197,27 @@ function logTokenStats(req, route, targetPath, requestTokens, usage, note = '') 
 function logTokenStatsAscii(req, route, targetPath, requestTokens, usage, note = '') {
   const stats = formatTokenStats(requestTokens, usage);
   const translationTarget = route?.translation?.target || 'anthropic';
-  const requestLabel = Number.isFinite(stats.requestTokens) ? `request~=${stats.requestTokens}` : 'request~=unknown';
-  const usageLabel = usage
-    ? `input=${stats.inputTokens}, output=${stats.outputTokens}, cached=${stats.cachedTokens ?? 'unknown'}, total=${stats.totalTokens}`
-    : 'input/output=unknown';
-  const noteLabel = note ? ` ${note}` : '';
+  
+  const reqTokens = Number.isFinite(stats.requestTokens) ? stats.requestTokens : '?';
+  const cached = stats.cachedTokens ?? 0;
+  const input = stats.inputTokens ?? 0;
+  const output = stats.outputTokens ?? 0;
+  const total = stats.totalTokens ?? 0;
+  
+  const cacheRatio = input > 0 ? ((cached / input) * 100).toFixed(1) : '0.0';
+  const cacheHit = cached > 0 ? `[Cache HIT ${cacheRatio}%]` : '[Cache MISS]';
+  
+  const upstreamInfo = note ? ` ${note}` : '';
 
   console.log(
-    `[Token Stats][${translationTarget}] ${req.method} ${req.originalUrl} -> ${targetPath} ${requestLabel} ${usageLabel}${noteLabel}`,
+    `[Stats][${translationTarget}] ${cacheHit} input=${input} (cached=${cached}), output=${output}, total=${total}${upstreamInfo}`,
   );
 }
 
 function logTranslatedTokenStats(req, route, targetPath, requestTokens, payload, usage, note = '') {
   const upstreamTokens = estimateTokensFromBody(payload || {});
-  const upstreamLabel = Number.isFinite(upstreamTokens) ? `upstream~=${upstreamTokens}` : 'upstream~=unknown';
-  const noteLabel = note ? `${note} ${upstreamLabel}` : upstreamLabel;
-  logTokenStatsAscii(req, route, targetPath, requestTokens, usage, noteLabel);
+  const upstreamLabel = Number.isFinite(upstreamTokens) ? `upstream≈${upstreamTokens}` : 'upstream≈?';
+  logTokenStatsAscii(req, route, targetPath, requestTokens, usage, upstreamLabel);
 }
 
 function attachAbortHandlers(req, res, controller) {
@@ -216,7 +237,7 @@ function attachAbortHandlers(req, res, controller) {
 
 async function handleTranslatedHeadRequest(req, res, route, config) {
   const targetUrl = buildTargetUrl(route, route.upstreamPath, '');
-  console.log(`[Translate Fetch] ${req.method} ${req.originalUrl} -> ${targetUrl}`);
+  console.log(`[Translate] GET ${targetUrl}`);
 
   const headers = buildOpenAIHeaders(req.headers, config, {
     accept: 'application/json',
@@ -233,11 +254,12 @@ async function handleTranslatedHeadRequest(req, res, route, config) {
     });
 
     const responseContentType = response.headers.get('content-type') || '';
-    console.log(`[Translate Response] ${req.method} ${req.originalUrl} -> Status: ${response.status} Content-Type: ${responseContentType || 'unknown'}`);
-    res.status(response.status).end();
+    console.log(`[Translate] HEAD ${targetUrl} -> ${response.status} (${responseContentType})`);
+    res.status(200).end();
+    return;
   } catch (error) {
     if (error?.name === 'AbortError' || /aborted/i.test(error?.message || '')) {
-      console.warn(`[Translate Abort] ${req.method} ${req.originalUrl} -> ${targetPath}`);
+      console.warn(`[Translate] ABORT HEAD ${targetUrl}`);
       return;
     }
 
@@ -431,17 +453,14 @@ function shouldRetryChatCompletionDialect(response, responseBody, dialectIndex, 
 async function handleTranslatedMessagesRequest(req, res, route, config, targetPath, translationSpec) {
   const requestTokens = estimateTokensFromBody(req.body || {});
   // Responses API branch does not preserve reasoning compatibility by design.
-  const preserveReasoningContent = translationSpec.source === 'anthropic' && translationSpec.targetPath !== '/responses';
+  const preserveReasoningContent = (translationSpec.source === 'anthropic' || translationSpec.source === 'openai') && translationSpec.targetPath !== '/responses';
   const targetUrl = buildTargetUrl(route, targetPath, '');
   const dialectCacheKey = isOpenAIResponsesToChatCompletions(translationSpec) ? targetUrl : '';
   const cachedDialect = getConfiguredChatCompletionDialect(translationSpec, config) === 'auto'
     ? getCachedChatCompletionDialect(dialectCacheKey, config)
     : null;
   const dialects = getChatCompletionDialectSequence(translationSpec, config, dialectCacheKey);
-  console.log(`[Translate Fetch] ${req.method} ${req.originalUrl} -> ${targetUrl}`);
-  if (cachedDialect) {
-    console.log(`[Translate Dialect Cache] ${req.method} ${req.originalUrl} -> ${targetUrl}: using cached chat completion dialect ${cachedDialect}`);
-  }
+  console.log(`[Translate] ${req.method} ${targetUrl}${cachedDialect ? ` (cached: ${cachedDialect})` : ''}`);
 
   const controller = new AbortController();
   attachAbortHandlers(req, res, controller);
@@ -469,7 +488,7 @@ async function handleTranslatedMessagesRequest(req, res, route, config, targetPa
       });
       const responseContentType = response.headers.get('content-type') || '';
       const dialectNote = chatCompletionDialect ? ` dialect=${chatCompletionDialect}` : '';
-      console.log(`[Translate Response] ${req.method} ${req.originalUrl} -> Status: ${response.status} Content-Type: ${responseContentType || 'unknown'}${dialectNote}`);
+      console.log(`[Translate] Response -> ${response.status} (${responseContentType})${dialectNote}`);
 
       if (!response.ok) {
         const responseBody = await fetchJsonOrText(response);
@@ -587,7 +606,7 @@ async function handleTranslatedMessagesResponse(req, res, route, targetPath, tra
 
 async function handleTranslatedModelsRequest(req, res, route, config, targetPath) {
   const targetUrl = buildTargetUrl(route, targetPath, translateAnthropicModelListQuery(route.search));
-  console.log(`[Translate Fetch] ${req.method} ${req.originalUrl} -> ${targetUrl}`);
+  console.log(`[Translate] GET ${targetUrl}`);
   const headers = buildOpenAIHeaders(req.headers, config, {
     accept: 'application/json',
   });
@@ -602,7 +621,7 @@ async function handleTranslatedModelsRequest(req, res, route, config, targetPath
       signal: controller.signal,
     });
     const responseContentType = response.headers.get('content-type') || '';
-    console.log(`[Translate Response] ${req.method} ${req.originalUrl} -> Status: ${response.status} Content-Type: ${responseContentType || 'unknown'}`);
+    console.log(`[Translate] Response -> ${response.status} (${responseContentType})`);
 
     if (!response.ok) {
       const responseBody = await fetchJsonOrText(response);
@@ -681,7 +700,7 @@ async function handleTranslationMiddleware(req, res, next) {
   if (req.method === 'POST' && splitPathTail(normalizedPath, translationSpec.sourcePath)) {
     const targetPath = translatePathTail(normalizedPath, translationSpec.sourcePath, translationSpec.targetPath);
     if (targetPath) {
-      console.log(`[Translate] ${req.method} ${req.originalUrl} -> ${targetPath}`);
+      console.log(`[Translate] POST ${req.originalUrl}`);
       return handleTranslatedMessagesRequest(
         req,
         res,
@@ -696,7 +715,7 @@ async function handleTranslationMiddleware(req, res, next) {
   if (translationSpec.source === 'anthropic' && req.method === 'GET' && isAnthropicModelsListPath(normalizedPath)) {
     const targetPath = translatePathTail(normalizedPath, '/models', '/models');
     if (targetPath) {
-      console.log(`[Translate] ${req.method} ${req.originalUrl} -> ${targetPath}`);
+      console.log(`[Translate] GET ${req.originalUrl}`);
       return handleTranslatedModelsRequest(req, res, route, proxyConfig, targetPath);
     }
   }
@@ -705,7 +724,7 @@ async function handleTranslationMiddleware(req, res, next) {
   if (translationSpec.source === 'anthropic' && req.method === 'GET' && detailMatch) {
     const targetPath = translatePathTail(normalizedPath, `/models/${detailMatch[2]}`, `/models/${detailMatch[2]}`);
     if (targetPath) {
-      console.log(`[Translate] ${req.method} ${req.originalUrl} -> ${targetPath}`);
+      console.log(`[Translate] GET ${req.originalUrl}`);
       return handleTranslatedModelsRequest(req, res, route, proxyConfig, targetPath);
     }
   }
@@ -758,7 +777,7 @@ function createApp(config = getConfig()) {
       const rewriteRules = req.proxyRoute?.rewriteRules || [];
       const newModel = rewriteModelName(oldModel, req.headers, rewriteRules);
       if (oldModel !== newModel) {
-        console.log(`[Model Rewrite] ${oldModel} -> ${newModel} (rules: ${rewriteRules.join(', ')})`);
+        console.log(`[Rewrite] ${oldModel} -> ${newModel}`);
         req.body.model = newModel;
       }
     }
@@ -793,10 +812,10 @@ function createApp(config = getConfig()) {
           proxyReq.removeHeader('transfer-encoding');
           fixRequestBody(proxyReq, req);
         }
-        console.log(`[Proxy Request] ${req.method} ${req.originalUrl} -> ${proxyReq.protocol}//${proxyReq.host}${proxyReq.path}`);
+        console.log(`[Proxy] ${req.method} ${proxyReq.protocol}//${proxyReq.host}${proxyReq.path}`);
       },
       proxyRes: (proxyRes, req) => {
-        console.log(`[Proxy Response] ${req.method} ${req.originalUrl} -> Status: ${proxyRes.statusCode}`);
+        console.log(`[Proxy] Response -> Status: ${proxyRes.statusCode}`);
         if (proxyRes.statusCode >= 400) {
           const body = [];
           proxyRes.on('data', (chunk) => {

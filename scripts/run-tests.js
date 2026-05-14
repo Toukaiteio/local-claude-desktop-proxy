@@ -44,6 +44,7 @@ const {
   openAIResponsesToChatCompletion,
   streamOpenAIChatCompletionToResponses,
 } = require('../src/translation/openai-interop');
+const { fixOpenAIChatCompletionPayload } = require('../src/translation/openai-fixer');
 const { parseSseStream } = require('../src/translation/sse');
 
 const tests = [];
@@ -1557,6 +1558,40 @@ test('parses a simple SSE stream', async () => {
 });
 
 const { runRewriteTests } = require('../test/rewrite.test');
+
+test('fixOpenAIChatCompletionPayload: basic extraction', () => {
+  const payload = {
+    messages: [
+      { role: 'user', content: 'hello' },
+      { role: 'assistant', content: '<thought>I am thinking</thought>Hello there!' }
+    ]
+  };
+  const fixed = fixOpenAIChatCompletionPayload(payload);
+  assert.equal(fixed.messages[1].reasoning_content, 'I am thinking');
+  assert.equal(fixed.messages[1].content, 'Hello there!');
+});
+
+test('fixOpenAIChatCompletionPayload: multiple blocks', () => {
+  const payload = {
+    messages: [
+      { role: 'assistant', content: '<thought>Part 1</thought>Some text<thought>Part 2</thought>' }
+    ]
+  };
+  const fixed = fixOpenAIChatCompletionPayload(payload);
+  assert.equal(fixed.messages[0].reasoning_content, 'Part 1\n\nPart 2');
+  assert.equal(fixed.messages[0].content, 'Some text');
+});
+
+test('fixOpenAIChatCompletionPayload: already has reasoning_content', () => {
+  const payload = {
+    messages: [
+      { role: 'assistant', content: 'Hello', reasoning_content: 'Existing' }
+    ]
+  };
+  const fixed = fixOpenAIChatCompletionPayload(payload);
+  assert.equal(fixed.messages[0].reasoning_content, 'Existing');
+  assert.equal(fixed.messages[0].content, 'Hello');
+});
 
 async function main() {
   let failed = 0;

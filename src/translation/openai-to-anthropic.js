@@ -10,6 +10,12 @@ const {
   toIsoTimestamp,
 } = require('./utils');
 
+const {
+  openAIChatCompletionDialectCache,
+  rememberChatCompletionDialect,
+} = require('../server'); // This might cause circular dependency if not careful, let's check
+const { recordReasoning } = require('./openai-fixer');
+
 function normalizeCreatedAt(value) {
   if (typeof value === 'string') {
     return value;
@@ -147,6 +153,12 @@ function openAIChatCompletionToAnthropic(response, context = {}) {
   const reasoningContent = typeof message?.reasoning_content === 'string' && message.reasoning_content.trim() !== ''
     ? message.reasoning_content
     : extractReasoningFromOpenAIContent(message?.content);
+  
+  const text = extractTextFromOpenAIContent(message?.content);
+  if (text && reasoningContent) {
+    recordReasoning(text, reasoningContent);
+  }
+
   return {
     id: toAnthropicMessageId(response?.id),
     type: 'message',
@@ -420,6 +432,8 @@ async function streamOpenAIChatCompletionToAnthropic(openAIResponse, res, contex
     openToolBlocks: new Map(),
     latestUsage: null,
     finalStopReason: 'end_turn',
+    textBuffer: '',
+    reasoningBuffer: '',
   };
 
   const ensureMessageStarted = () => {
@@ -615,10 +629,12 @@ async function streamOpenAIChatCompletionToAnthropic(openAIResponse, res, contex
 
       const delta = choice.delta || {};
       if (typeof delta.reasoning_content === 'string' && delta.reasoning_content.trim() !== '') {
+        state.reasoningBuffer += delta.reasoning_content;
         appendReasoningDelta(delta.reasoning_content);
       }
       const text = extractDeltaText(delta);
       if (text) {
+        state.textBuffer += text;
         appendTextDelta(text);
       }
 
@@ -645,6 +661,11 @@ async function streamOpenAIChatCompletionToAnthropic(openAIResponse, res, contex
     if (state.activeKind === 'reasoning') {
       closeReasoningBlock();
     }
+
+    if (state.textBuffer && state.reasoningBuffer) {
+      recordReasoning(state.textBuffer, state.reasoningBuffer);
+    }
+
     writeSseEvent(res, 'message_delta', buildAnthropicMessageDelta(state.finalStopReason, state.latestUsage));
     writeSseEvent(res, 'message_stop', {
       type: 'message_stop',

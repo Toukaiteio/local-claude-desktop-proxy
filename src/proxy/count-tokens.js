@@ -25,8 +25,8 @@ function handleCountTokens(req, res) {
   }
 
   const estimatedTokens = estimateTokensFromBody(req.body);
+  console.log(`[Tokens] Count -> ${estimatedTokens}`);
 
-  console.log(`[Mock count_tokens] ${req.path} input_tokens=${estimatedTokens}`);
   res.status(200).json({
     input_tokens: estimatedTokens,
   });

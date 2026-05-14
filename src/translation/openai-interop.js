@@ -1,5 +1,6 @@
 const { parseSseStream, prepareSseResponse, writeSseEvent } = require('./sse');
 const { mapUsage, safeJsonParse, stringifyJson } = require('./utils');
+const { recordReasoning } = require('./openai-fixer');
 
 function normalizeArray(value) {
   return Array.isArray(value) ? value : [];
@@ -1132,6 +1133,11 @@ function openAIChatCompletionToResponses(response, context = {}) {
 
   const choice = normalizeArray(response?.choices)[0] || {};
   const message = choice.message || {};
+
+  if (message.content != null && message.reasoning_content) {
+    recordReasoning(message.content, message.reasoning_content);
+  }
+
   const output = [];
   const content = [];
 
@@ -1325,6 +1331,73 @@ function writeResponsesAsSse(res, response) {
   res.end();
 }
 
+async function streamOpenAIChatCompletionToOpenAI(openAIResponse, res, context = {}) {
+  prepareSseResponse(res);
+
+  if (!openAIResponse?.body?.getReader) {
+    throw new Error('OpenAI response body is not a readable stream');
+  }
+
+  let latestUsage = null;
+  let textBuffer = '';
+  let reasoningBuffer = '';
+
+  try {
+    for await (const event of parseSseStream(openAIResponse.body)) {
+      if (!event || typeof event.data !== 'string') continue;
+
+      if (event.data === '[DONE]') {
+        res.write('data: [DONE]\n\n');
+        continue;
+      }
+
+      const chunk = safeJsonParse(event.data);
+      if (chunk && chunk.usage) {
+        latestUsage = mapUsage(chunk.usage);
+      }
+
+      const choice = Array.isArray(chunk.choices) ? chunk.choices[0] : null;
+      if (choice && choice.delta) {
+        if (typeof choice.delta.content === 'string') {
+          textBuffer += choice.delta.content;
+        }
+        if (typeof choice.delta.reasoning_content === 'string') {
+          reasoningBuffer += choice.delta.reasoning_content;
+        }
+      }
+
+      writeSseEvent(res, event.event === 'message' || !event.event ? null : event.event, event.data);
+    }
+
+    if (textBuffer && reasoningBuffer) {
+      recordReasoning(textBuffer, reasoningBuffer);
+    }
+
+    res.end();
+    return latestUsage;
+  } catch (error) {
+    if (!res.headersSent) {
+      res.status(502).json({
+        error: {
+          type: 'api_error',
+          message: error.message,
+        },
+      });
+      return null;
+    }
+
+    writeSseEvent(res, 'error', {
+      type: 'error',
+      error: {
+        type: 'api_error',
+        message: error.message,
+      },
+    });
+    res.end();
+    return latestUsage;
+  }
+}
+
 module.exports = {
   buildOpenAIChatCompletionPayloadFromResponses,
   buildOpenAIResponsesPayloadFromChatCompletion,
@@ -1333,6 +1406,7 @@ module.exports = {
   openAIResponsesToChatCompletion,
   responsesUsageToChatUsage,
   streamOpenAIChatCompletionToResponses,
+  streamOpenAIChatCompletionToOpenAI,
   writeChatCompletionAsSse,
   writeResponsesAsSse,
 };

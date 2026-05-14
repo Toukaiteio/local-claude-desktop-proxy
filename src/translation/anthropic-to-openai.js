@@ -256,20 +256,36 @@ function extractReasoningContent(message) {
     return message.reasoning_content;
   }
 
+  // Handle case where it might be in 'thinking' or 'reasoning' fields (OpenAI style in Anthropic msg)
+  if (typeof message?.thinking === 'string' && message.thinking.trim() !== '') {
+    return message.thinking;
+  }
+  if (typeof message?.reasoning === 'string' && message.reasoning.trim() !== '') {
+    return message.reasoning;
+  }
+
   const blocks = normalizeContent(message?.content);
   const parts = [];
   for (const block of blocks) {
     if (!block || typeof block !== 'object') continue;
-    if (block.type === 'thinking') {
-      if (typeof block.thinking === 'string' && block.thinking.trim() !== '') {
-        parts.push(block.thinking);
-      } else if (typeof block.text === 'string' && block.text.trim() !== '') {
-        parts.push(block.text);
+    
+    // Standard thinking block types
+    if (block.type === 'thinking' || block.type === 'reasoning' || block.type === 'reasoning_summary' || block.type === 'thought') {
+      const thinkingText = block.thinking || block.reasoning || block.text || block.content || '';
+      if (typeof thinkingText === 'string' && thinkingText.trim() !== '') {
+        parts.push(thinkingText);
+      }
+    } 
+    // Handle cases where thinking is wrapped in <thought> or <thinking> tags in a text block
+    else if (block.type === 'text' && typeof block.text === 'string') {
+      const matches = block.text.matchAll(/<(thought|thinking)>([\s\S]*?)<\/\1>/gi);
+      for (const match of matches) {
+        parts.push(match[2].trim());
       }
     }
   }
 
-  return parts.join('');
+  return parts.join('\n\n');
 }
 
 function buildTools(tools) {
@@ -351,17 +367,29 @@ function convertAssistantMessage(message, state = {}, options = {}) {
   const blocks = normalizeContent(message.content);
   const textParts = [];
   const toolCalls = [];
-  const reasoningContent = extractReasoningContent(message);
-  const preserveReasoningContent = options.preserveReasoningContent !== false;
+  let reasoningContent = extractReasoningContent(message);
+
+  // Automatic assistance: if reasoning_content is missing but required by model/mode, 
+  // provide a placeholder to prevent API rejection (DeepSeek R1 requirement).
+  if (!reasoningContent && (options.isReasonerModel || options.isThinkingMode)) {
+    reasoningContent = '...';
+  }
 
   for (const block of blocks) {
     if (!block || typeof block !== 'object') continue;
 
     if (block.type === 'text') {
-      textParts.push({
-        type: 'text',
-        text: block.text ?? '',
-      });
+      let text = block.text ?? '';
+      // If we extracted thought tags, remove them from the content to avoid duplication
+      if (text.includes('<thought') || text.includes('<thinking')) {
+        text = text.replace(/<(thought|thinking)>[\s\S]*?<\/\1>/gi, '').trim();
+      }
+      if (text) {
+        textParts.push({
+          type: 'text',
+          text,
+        });
+      }
       continue;
     }
 
@@ -394,20 +422,18 @@ function convertAssistantMessage(message, state = {}, options = {}) {
     assistantMessage.name = message.name;
   }
 
+  // DeepSeek R1 / Reasoning models requirement: 
+  // reasoning_content MUST be passed back for history turns if it existed.
+  if (reasoningContent) {
+    assistantMessage.reasoning_content = reasoningContent;
+  }
+
   if (textParts.length > 0) {
     assistantMessage.content = openAIContentPartsToValue(textParts);
   }
 
   if (toolCalls.length > 0) {
     assistantMessage.tool_calls = toolCalls;
-  }
-
-  const shouldPreserveReasoningContent = preserveReasoningContent
-    && reasoningContent
-    && options.thinkingMode !== 'disabled';
-
-  if (shouldPreserveReasoningContent) {
-    assistantMessage.reasoning_content = reasoningContent;
   }
 
   if (assistantMessage.content === undefined && assistantMessage.tool_calls === undefined) {
@@ -441,6 +467,40 @@ function convertMessage(message, state = {}, options = {}) {
   return [];
 }
 
+function consolidateMessages(messages) {
+  if (!Array.isArray(messages) || messages.length === 0) {
+    return messages;
+  }
+
+  const consolidated = [];
+  let currentMessage = null;
+
+  for (const msg of messages) {
+    if (!msg) continue;
+
+    const isMergeable = (m) =>
+      m &&
+      (m.role === 'user' || m.role === 'assistant' || m.role === 'system') &&
+      typeof m.content === 'string' &&
+      !m.tool_calls &&
+      !m.name;
+
+    if (currentMessage && isMergeable(currentMessage) && isMergeable(msg) && currentMessage.role === msg.role) {
+      if (msg.content) {
+        currentMessage.content += (currentMessage.content ? '\n\n' : '') + msg.content;
+      }
+      if (msg.reasoning_content) {
+        currentMessage.reasoning_content = (currentMessage.reasoning_content || '') + (currentMessage.reasoning_content ? '\n\n' : '') + msg.reasoning_content;
+      }
+    } else {
+      currentMessage = { ...msg };
+      consolidated.push(currentMessage);
+    }
+  }
+
+  return consolidated;
+}
+
 function buildOpenAIChatCompletionPayload(anthropicBody, options = {}) {
   const payload = {};
   const state = {
@@ -454,22 +514,6 @@ function buildOpenAIChatCompletionPayload(anthropicBody, options = {}) {
     payload.model = resolvedModel;
   }
 
-  const messages = [];
-  if (anthropicBody?.system != null) {
-    const systemContent = buildSystemContent(anthropicBody.system);
-    if (systemContent !== undefined) {
-      messages.push({
-        role: 'system',
-        content: systemContent,
-      });
-    }
-  }
-
-  for (const message of Array.isArray(anthropicBody?.messages) ? anthropicBody.messages : []) {
-    messages.push(...convertMessage(message, state, options));
-  }
-  payload.messages = messages;
-
   const thinkingPayload = normalizeThinkingPayload(anthropicBody?.thinking, options.thinkingMode);
   if (thinkingPayload) {
     payload.thinking = thinkingPayload;
@@ -479,6 +523,41 @@ function buildOpenAIChatCompletionPayload(anthropicBody, options = {}) {
   if (reasoningEffort) {
     payload.reasoning_effort = reasoningEffort;
   }
+
+  const isReasonerModel = /reasoner|r1|thinking/i.test(payload.model || '');
+  const isThinkingMode = payload.reasoning_effort && payload.reasoning_effort !== 'none';
+  const fixerOptions = { ...options, isReasonerModel, isThinkingMode };
+
+  let messages = [];
+  let systemMessage = null;
+  let systemContentStr = '';
+
+  if (anthropicBody?.system != null) {
+    const systemContent = buildSystemContent(anthropicBody.system);
+    if (systemContent !== undefined) {
+      systemMessage = {
+        role: 'system',
+        content: systemContent,
+      };
+      systemContentStr = (typeof systemContent === 'string' ? systemContent : JSON.stringify(systemContent)).trim();
+      messages.push(systemMessage);
+    }
+  }
+
+  for (const message of Array.isArray(anthropicBody?.messages) ? anthropicBody.messages : []) {
+    const converted = convertMessage(message, state, fixerOptions);
+    
+    // Aggressive deduplication: drop any message (user or system) that matches the system content exactly
+    if (systemMessage && converted.length === 1 && (converted[0].role === 'system' || converted[0].role === 'user')) {
+      const convertedStr = (typeof converted[0].content === 'string' ? converted[0].content : JSON.stringify(converted[0].content)).trim();
+      if (convertedStr === systemContentStr) {
+        continue;
+      }
+    }
+    messages.push(...converted);
+  }
+
+  payload.messages = consolidateMessages(messages);
 
   const copyFields = [
     'temperature',

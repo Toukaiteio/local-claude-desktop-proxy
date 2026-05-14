@@ -66,9 +66,25 @@ When this header is present, the provider prefix is stripped:
 
 This rewrite applies to any incoming request with a `model` field, including passthrough and translated routes.
 
+## Translation Routes
+
+- `$anthropic|openai`: Translate Anthropic Messages to OpenAI Chat Completions.
+- `$anthropic|openai_response`: Translate Anthropic Messages to OpenAI Responses.
+- `$openai|openai`: Intercept and "fix" OpenAI Chat Completions (e.g., extracting `reasoning_content` from history for DeepSeek R1).
+- `$openai|openai_response`: Translate OpenAI Chat Completions to OpenAI Responses.
+- `$openai_response|openai`: Translate OpenAI Responses back to OpenAI Chat Completions.
+
+## Reasoning Content Compatibility
+
+The proxy includes advanced support for `reasoning_content` (DeepSeek R1 / OpenAI o1 style thinking blocks):
+
+- **Automatic Extraction**: When using `$anthropic|openai` or `$openai|openai`, the proxy automatically scans assistant messages in the history. It extracts thinking blocks from various formats (tags like `<thought>`, `<thinking>`, or dedicated fields like `thinking`, `reasoning`) and maps them to the OpenAI `reasoning_content` field required by providers like DeepSeek.
+- **DeepSeek R1 Fixer**: If a reasoning-enabled model is detected (e.g., `deepseek-reasoner`, `r1`), the proxy ensures every assistant message in the history has a `reasoning_content` field. If one is missing and cannot be extracted from content, it provides a minimal placeholder (`...`) to prevent the upstream API from rejecting the request with a "reasoning_content must be passed back" error.
+- **Thinking Mode**: Maps Anthropic's `thinking` configuration to OpenAI's `reasoning_effort`.
+
 When using `$anthropic|openai_response`, the proxy normalizes tool-call IDs to the `fc_...` / `call_...` format expected by the Responses API, which avoids `input[n].id` validation errors.
 If the source Anthropic request includes `thinking.effort`, `thinking`, or `output_config.effort`, the proxy maps them to OpenAI Responses `reasoning.effort`.
-For `$anthropic|openai` routes, the proxy maps source `thinking.effort`, `thinking`, or `output_config.effort` to OpenAI Chat Completions `reasoning_effort`, and preserves `reasoning_content` whenever the source conversation includes it, even when there are no tool calls.
+For `$anthropic|openai` routes, the proxy maps source `thinking.effort`, `thinking`, or `output_config.effort` to OpenAI Chat Completions `reasoning_effort`.
 For `$anthropic|openai_response` routes, the proxy disables `reasoning_content` compatibility entirely and does not preserve or re-inject reasoning blocks on the Responses branch.
 Both OpenAI translation branches forward `prompt_cache_key` and `prompt_cache_retention` when present, so callers can opt into OpenAI prompt caching directly.
 
