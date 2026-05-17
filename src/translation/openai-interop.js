@@ -1135,7 +1135,7 @@ function openAIChatCompletionToResponses(response, context = {}) {
   const message = choice.message || {};
 
   if (message.content != null && message.reasoning_content) {
-    recordReasoning(message.content, message.reasoning_content);
+    recordReasoning(message, message.reasoning_content);
   }
 
   const output = [];
@@ -1341,6 +1341,8 @@ async function streamOpenAIChatCompletionToOpenAI(openAIResponse, res, context =
   let latestUsage = null;
   let textBuffer = '';
   let reasoningBuffer = '';
+  const streamedToolCalls = new Map();
+  let streamedFunctionCall = null;
 
   try {
     for await (const event of parseSseStream(openAIResponse.body)) {
@@ -1364,13 +1366,54 @@ async function streamOpenAIChatCompletionToOpenAI(openAIResponse, res, context =
         if (typeof choice.delta.reasoning_content === 'string') {
           reasoningBuffer += choice.delta.reasoning_content;
         }
+        if (Array.isArray(choice.delta.tool_calls)) {
+          for (let i = 0; i < choice.delta.tool_calls.length; i += 1) {
+            const deltaTool = choice.delta.tool_calls[i];
+            const key = String(deltaTool?.index ?? i);
+            const current = streamedToolCalls.get(key) || {
+              id: deltaTool?.id || `call_${key}`,
+              type: deltaTool?.type || 'function',
+              function: {
+                name: '',
+                arguments: '',
+              },
+            };
+            if (deltaTool?.id) current.id = deltaTool.id;
+            if (deltaTool?.type) current.type = deltaTool.type;
+            if (deltaTool?.function?.name) current.function.name = deltaTool.function.name;
+            if (typeof deltaTool?.function?.arguments === 'string') {
+              current.function.arguments += deltaTool.function.arguments;
+            }
+            streamedToolCalls.set(key, current);
+          }
+        }
+        if (choice.delta.function_call && typeof choice.delta.function_call === 'object') {
+          if (!streamedFunctionCall) {
+            streamedFunctionCall = {
+              name: '',
+              arguments: '',
+            };
+          }
+          if (choice.delta.function_call.name) {
+            streamedFunctionCall.name = choice.delta.function_call.name;
+          }
+          if (typeof choice.delta.function_call.arguments === 'string') {
+            streamedFunctionCall.arguments += choice.delta.function_call.arguments;
+          }
+        }
       }
 
       writeSseEvent(res, event.event === 'message' || !event.event ? null : event.event, event.data);
     }
 
     if (textBuffer && reasoningBuffer) {
-      recordReasoning(textBuffer, reasoningBuffer);
+      const assistantMessage = {
+        role: 'assistant',
+        content: textBuffer,
+        ...(streamedToolCalls.size > 0 ? { tool_calls: Array.from(streamedToolCalls.values()) } : {}),
+        ...(streamedFunctionCall ? { function_call: streamedFunctionCall } : {}),
+      };
+      recordReasoning(assistantMessage, reasoningBuffer);
     }
 
     res.end();

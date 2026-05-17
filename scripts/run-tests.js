@@ -20,6 +20,8 @@ const {
   DEFAULT_OPENAI_THINKING_MODE,
   DEFAULT_OVERWRITE_UA,
   getConfig,
+  DEFAULT_PROXY_TIMEOUT_MS,
+  DEFAULT_UPSTREAM_TIMEOUT_MS,
 } = require('../src/config');
 const {
   clearCachedChatCompletionDialect,
@@ -44,7 +46,11 @@ const {
   openAIResponsesToChatCompletion,
   streamOpenAIChatCompletionToResponses,
 } = require('../src/translation/openai-interop');
-const { fixOpenAIChatCompletionPayload } = require('../src/translation/openai-fixer');
+const {
+  analyzeOpenAIResponsesPayload,
+  fixOpenAIChatCompletionPayload,
+  fixOpenAIResponsesPayload,
+} = require('../src/translation/openai-fixer');
 const { parseSseStream } = require('../src/translation/sse');
 
 const tests = [];
@@ -1477,6 +1483,8 @@ test('defaults head mode to ack', () => {
   assert.equal(emptyConfig.openaiModel, DEFAULT_OPENAI_MODEL);
   assert.equal(emptyConfig.openaiThinkingMode, DEFAULT_OPENAI_THINKING_MODE);
   assert.equal(emptyConfig.overwriteUserAgent, DEFAULT_OVERWRITE_UA);
+  assert.equal(emptyConfig.proxyTimeoutMs, DEFAULT_PROXY_TIMEOUT_MS);
+  assert.equal(emptyConfig.upstreamTimeoutMs, DEFAULT_UPSTREAM_TIMEOUT_MS);
   assert.equal(getConfig({ HEAD_MODE: 'proxy' }).headMode, 'proxy');
   assert.equal(getConfig({ OPENAI_API_KEY: 'sk-test' }).openaiApiKey, 'sk-test');
   assert.equal(getConfig({ OPENAI_MODEL: 'gpt-test' }).openaiModel, 'gpt-test');
@@ -1489,6 +1497,10 @@ test('defaults head mode to ack', () => {
   assert.equal(getConfig({ OPENAI_THINKING_MODE: 'enabled' }).openaiThinkingMode, 'enabled');
   assert.equal(getConfig({ OPENAI_THINKING_MODE: 'source' }).openaiThinkingMode, 'source');
   assert.equal(getConfig({ OVERWRITE_UA: 'CustomUA/2.0' }).overwriteUserAgent, 'CustomUA/2.0');
+  assert.equal(getConfig({ PROXY_TIMEOUT_MS: '45000' }).proxyTimeoutMs, 45000);
+  assert.equal(getConfig({ PROXY_TIMEOUT_MS: 'off' }).proxyTimeoutMs, 0);
+  assert.equal(getConfig({ UPSTREAM_TIMEOUT_MS: '60000' }).upstreamTimeoutMs, 60000);
+  assert.equal(getConfig({ UPSTREAM_TIMEOUT_MS: 'disabled' }).upstreamTimeoutMs, 0);
 });
 
 test('caches successful OpenAI chat completion dialects for auto mode', () => {
@@ -1591,6 +1603,156 @@ test('fixOpenAIChatCompletionPayload: already has reasoning_content', () => {
   const fixed = fixOpenAIChatCompletionPayload(payload);
   assert.equal(fixed.messages[0].reasoning_content, 'Existing');
   assert.equal(fixed.messages[0].content, 'Hello');
+});
+
+test('fixOpenAIChatCompletionPayload: injects non-empty synthetic reasoning_content when missing (openai_fix)', () => {
+  const payload = {
+    model: 'any-provider-model',
+    messages: [
+      { role: 'user', content: 'hello' },
+      { role: 'assistant', content: 'plain assistant text without thought blocks' },
+    ],
+  };
+
+  const fixed = fixOpenAIChatCompletionPayload(payload);
+  assert.equal(typeof fixed.messages[1].reasoning_content, 'string');
+  assert.ok(fixed.messages[1].reasoning_content.length > 0);
+  assert.equal(fixed.messages[1].content, 'plain assistant text without thought blocks');
+});
+
+test('fixOpenAIChatCompletionPayload: still injects non-empty synthetic reasoning_content when explicitly disabled but field is missing', () => {
+  const payload = {
+    model: 'any-provider-model',
+    reasoning_effort: 'none',
+    messages: [
+      { role: 'assistant', content: 'plain assistant text without thought blocks' },
+    ],
+  };
+
+  const fixed = fixOpenAIChatCompletionPayload(payload);
+  assert.equal(typeof fixed.messages[0].reasoning_content, 'string');
+  assert.ok(fixed.messages[0].reasoning_content.length > 0);
+  assert.equal(fixed.messages[0].content, 'plain assistant text without thought blocks');
+});
+
+test('fixOpenAIChatCompletionPayload: normalizes invalid reasoning_content values to non-empty string', () => {
+  const payload = {
+    model: 'any-provider-model',
+    reasoning_effort: 'high',
+    messages: [
+      { role: 'assistant', content: 'a', reasoning_content: '' },
+      { role: 'assistant', content: 'b', reasoning_content: '   ' },
+      { role: 'assistant', content: 'c', reasoning_content: null },
+      { role: 'assistant', content: 'd', reasoning_content: { value: 'x' } },
+    ],
+  };
+
+  const fixed = fixOpenAIChatCompletionPayload(payload);
+  assert.ok(typeof fixed.messages[0].reasoning_content === 'string' && fixed.messages[0].reasoning_content.length > 0);
+  assert.ok(typeof fixed.messages[1].reasoning_content === 'string' && fixed.messages[1].reasoning_content.length > 0);
+  assert.ok(typeof fixed.messages[2].reasoning_content === 'string' && fixed.messages[2].reasoning_content.length > 0);
+  assert.ok(typeof fixed.messages[3].reasoning_content === 'string' && fixed.messages[3].reasoning_content.length > 0);
+});
+
+test('fixOpenAIResponsesPayload: normalizes text content parts by role', () => {
+  const payload = {
+    input: [
+      {
+        type: 'message',
+        role: 'user',
+        content: [{ type: 'text', text: 'hello' }],
+      },
+      {
+        type: 'message',
+        role: 'assistant',
+        content: [{ type: 'text', text: 'world' }],
+      },
+    ],
+  };
+
+  const fixed = fixOpenAIResponsesPayload(payload);
+  assert.equal(fixed.input[0].content[0].type, 'input_text');
+  assert.equal(fixed.input[1].content[0].type, 'output_text');
+});
+
+test('fixOpenAIResponsesPayload: normalizes image_url content parts', () => {
+  const payload = {
+    input: [
+      {
+        type: 'message',
+        role: 'user',
+        content: [{
+          type: 'image_url',
+          image_url: {
+            url: 'https://example.com/demo.png',
+            detail: 'low',
+          },
+        }],
+      },
+    ],
+  };
+
+  const fixed = fixOpenAIResponsesPayload(payload);
+  assert.equal(fixed.input[0].content[0].type, 'input_image');
+  assert.equal(fixed.input[0].content[0].image_url, 'https://example.com/demo.png');
+  assert.equal(fixed.input[0].content[0].detail, 'low');
+});
+
+test('fixOpenAIResponsesPayload: keeps payload reference when no changes are needed', () => {
+  const payload = {
+    input: [
+      {
+        type: 'message',
+        role: 'user',
+        content: [{ type: 'input_text', text: 'already normalized' }],
+      },
+    ],
+  };
+
+  const fixed = fixOpenAIResponsesPayload(payload);
+  assert.equal(fixed, payload);
+});
+
+test('analyzeOpenAIResponsesPayload: reports unsupported responses content part types', () => {
+  const analysis = analyzeOpenAIResponsesPayload({
+    input: [
+      {
+        type: 'message',
+        role: 'user',
+        content: [
+          { type: 'text', text: 'legacy type' },
+          { type: 'input_text', text: 'ok' },
+        ],
+      },
+    ],
+  });
+
+  assert.equal(analysis.contentTypeCounts.text, 1);
+  assert.equal(analysis.contentTypeCounts.input_text, 1);
+  assert.equal(analysis.issues.length, 1);
+  assert.equal(analysis.issues[0].path, 'input[0].content[0].type');
+  assert.equal(analysis.issues[0].issue, 'unsupported_content_type');
+});
+
+test('analyzeOpenAIResponsesPayload: accepts canonical responses content part types', () => {
+  const analysis = analyzeOpenAIResponsesPayload({
+    input: [
+      {
+        type: 'message',
+        role: 'user',
+        content: [{ type: 'input_text', text: 'ok' }],
+      },
+      {
+        type: 'message',
+        role: 'assistant',
+        content: [{ type: 'output_text', text: 'ok' }],
+      },
+    ],
+  });
+
+  assert.equal(analysis.issues.length, 0);
+  assert.equal(analysis.contentTypeCounts.input_text, 1);
+  assert.equal(analysis.contentTypeCounts.output_text, 1);
 });
 
 async function main() {

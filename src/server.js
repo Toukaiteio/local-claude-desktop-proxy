@@ -1,5 +1,6 @@
 const express = require('express');
 const bodyParser = require('body-parser');
+const { createHash } = require('crypto');
 const { createProxyMiddleware, fixRequestBody } = require('http-proxy-middleware');
 const { getConfig } = require('./config');
 const { handleCountTokens, estimateTokensFromBody } = require('./proxy/count-tokens');
@@ -39,84 +40,227 @@ const {
   writeResponsesAsSse,
 } = require('./translation/openai-interop');
 const {
+  analyzeOpenAIResponsesPayload,
   fixOpenAIChatCompletionPayload,
+  fixOpenAIResponsesPayload,
 } = require('./translation/openai-fixer');
+const { buildRegistry } = require('./adaptor');
 
-const TRANSLATION_PAIRS = new Set([
-  'anthropic|openai',
-  'anthropic|openai_response',
-  'openai|openai',
-  'openai|openai_response',
-  'openai_response|openai',
-]);
+const TRANSLATION_PAIRS = new Set();
+
+const adaptorRegistry = buildRegistry({
+  buildOpenAIChatCompletionPayload,
+  buildOpenAIResponsesPayload,
+  buildOpenAIChatCompletionPayloadFromResponses,
+  buildOpenAIResponsesPayloadFromChatCompletion,
+  openAIChatCompletionToAnthropic,
+  streamOpenAIChatCompletionToAnthropic,
+  openAIResponsesToAnthropic,
+  streamOpenAIResponsesToAnthropic,
+  openAIChatCompletionToResponses,
+  streamOpenAIChatCompletionToResponses,
+  openAIResponsesToChatCompletion,
+  writeAnthropicMessageAsSse,
+  writeChatCompletionAsSse,
+  writeResponsesAsSse,
+  fixOpenAIChatCompletionPayload,
+  streamOpenAIChatCompletionToOpenAI,
+});
+
+for (const key of adaptorRegistry.keys()) {
+  TRANSLATION_PAIRS.add(key);
+}
+
 const OPENAI_CHAT_COMPLETION_DIALECTS = ['modern', 'hybrid', 'legacy'];
+const OPENAI_FIX_STRATEGY = 'replay_then_synthetic_non_empty_v1';
 const openAIChatCompletionDialectCache = new Map();
+let requestSequence = 0;
+
+function nextRequestId() {
+  requestSequence += 1;
+  return `${Date.now().toString(36)}-${requestSequence.toString(36)}`;
+}
+
+function buildBodyFingerprint(body) {
+  if (!body || typeof body !== 'object') {
+    return 'none';
+  }
+
+  try {
+    const serialized = JSON.stringify(body);
+    return createHash('sha1').update(serialized).digest('hex').slice(0, 12);
+  } catch {
+    return 'unserializable';
+  }
+}
+
+function summarizeResponsesInput(input) {
+  if (!Array.isArray(input)) {
+    return 'input=none';
+  }
+
+  let messageItems = 0;
+  let toolItems = 0;
+  let contentParts = 0;
+  const contentTypes = new Map();
+
+  for (const item of input) {
+    if (!item || typeof item !== 'object') continue;
+    if (item.type === 'function_call' || item.type === 'function_call_output') {
+      toolItems += 1;
+    } else if (item.type === 'message' || item.role) {
+      messageItems += 1;
+    }
+
+    if (Array.isArray(item.content)) {
+      contentParts += item.content.length;
+      for (const part of item.content) {
+        const type = typeof part?.type === 'string' ? part.type : 'unknown';
+        contentTypes.set(type, (contentTypes.get(type) || 0) + 1);
+      }
+    }
+  }
+
+  const topTypes = Array.from(contentTypes.entries())
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 4)
+    .map(([type, count]) => `${type}:${count}`)
+    .join(',');
+
+  return `inputItems=${input.length},messages=${messageItems},tools=${toolItems},parts=${contentParts}${topTypes ? `,partTypes=${topTypes}` : ''}`;
+}
+
+function summarizeRequestBody(body) {
+  if (!body || typeof body !== 'object') {
+    return 'body=none';
+  }
+
+  const summary = [];
+  if (body.model !== undefined) summary.push(`model=${body.model}`);
+  if (body.stream !== undefined) summary.push(`stream=${Boolean(body.stream)}`);
+  if (body.max_tokens !== undefined) summary.push(`max_tokens=${body.max_tokens}`);
+  if (body.max_output_tokens !== undefined) summary.push(`max_output_tokens=${body.max_output_tokens}`);
+  if (Array.isArray(body.messages)) summary.push(`messages=${body.messages.length}`);
+  if (Array.isArray(body.input)) summary.push(summarizeResponsesInput(body.input));
+  if (Array.isArray(body.tools)) summary.push(`tools=${body.tools.length}`);
+  if (body.tool_choice !== undefined) {
+    const choice = typeof body.tool_choice === 'string'
+      ? body.tool_choice
+      : body.tool_choice?.type || 'object';
+    summary.push(`tool_choice=${choice}`);
+  }
+
+  return summary.length > 0 ? summary.join(',') : 'body=object';
+}
+
+function summarizeResponsesContentTypeCounts(contentTypeCounts) {
+  const entries = Object.entries(contentTypeCounts || {});
+  if (entries.length === 0) {
+    return '-';
+  }
+
+  return entries
+    .sort((a, b) => b[1] - a[1])
+    .map(([type, count]) => `${type}:${count}`)
+    .join(',');
+}
+
+function summarizeResponsesIssues(issues, limit = 6) {
+  if (!Array.isArray(issues) || issues.length === 0) {
+    return '-';
+  }
+
+  return issues
+    .slice(0, limit)
+    .map((item) => `${item.path}:${item.issue}${item.value ? `(${item.value})` : ''}`)
+    .join('; ');
+}
+
+function summarizeAssistantReasoning(messages) {
+  if (!Array.isArray(messages)) {
+    return 'assistants=0';
+  }
+
+  let assistants = 0;
+  let missing = 0;
+  let empty = 0;
+  let nonEmpty = 0;
+  let nonString = 0;
+  let synthetic = 0;
+
+  for (const msg of messages) {
+    if (!msg || typeof msg !== 'object' || msg.role !== 'assistant') {
+      continue;
+    }
+    assistants += 1;
+
+    if (!Object.prototype.hasOwnProperty.call(msg, 'reasoning_content')) {
+      missing += 1;
+      continue;
+    }
+
+    if (typeof msg.reasoning_content !== 'string') {
+      nonString += 1;
+      continue;
+    }
+
+    if (msg.reasoning_content.trim() === '') {
+      empty += 1;
+    } else {
+      nonEmpty += 1;
+      if (msg.reasoning_content.startsWith('missing_reasoning_')) {
+        synthetic += 1;
+      }
+    }
+  }
+
+  return `assistants=${assistants},rc.missing=${missing},rc.empty=${empty},rc.nonEmpty=${nonEmpty},rc.nonString=${nonString},rc.synthetic=${synthetic}`;
+}
+
+function summarizeThinkingFlags(body) {
+  if (!body || typeof body !== 'object') {
+    return 'thinking=-,reasoning_effort=-';
+  }
+  const thinkingType = typeof body?.thinking?.type === 'string' ? body.thinking.type : '-';
+  const thinkingEffort = typeof body?.thinking?.effort === 'string' ? body.thinking.effort : '-';
+  const reasoningEffort = typeof body?.reasoning_effort === 'string' ? body.reasoning_effort : '-';
+  return `thinking.type=${thinkingType},thinking.effort=${thinkingEffort},reasoning_effort=${reasoningEffort}`;
+}
+
+function getRequestMeta(req) {
+  if (!req.__proxyMeta) {
+    req.__proxyMeta = {
+      id: nextRequestId(),
+      startedAt: Date.now(),
+      targetStartedAt: 0,
+      fingerprint: 'none',
+      bodySummary: 'body=none',
+    };
+  }
+
+  return req.__proxyMeta;
+}
+
+function getElapsedMs(req, from = 'startedAt') {
+  const meta = getRequestMeta(req);
+  const start = meta[from] || meta.startedAt;
+  return Math.max(0, Date.now() - start);
+}
+
+function formatRequestPrefix(req) {
+  return `[Req ${getRequestMeta(req).id}]`;
+}
 
 function isSupportedTranslation(route) {
-  return TRANSLATION_PAIRS.has(`${route?.translation?.source || ''}|${route?.translation?.target || ''}`);
+  return adaptorRegistry.has(route?.translation?.source || '', route?.translation?.target || '');
+}
+
+function getAdaptor(source, target) {
+  return adaptorRegistry.get(source, target) || null;
 }
 
 function getTranslationSpec(source, target) {
-  switch (`${source}|${target}`) {
-    case 'anthropic|openai':
-      return {
-        source: 'anthropic',
-        target: 'openai',
-        sourcePath: '/messages',
-        targetPath: '/chat/completions',
-        buildPayload: buildOpenAIChatCompletionPayload,
-        responseToSource: openAIChatCompletionToAnthropic,
-        streamToSource: streamOpenAIChatCompletionToAnthropic,
-        writeSourceAsSse: writeAnthropicMessageAsSse,
-      };
-    case 'anthropic|openai_response':
-      return {
-        source: 'anthropic',
-        target: 'openai_response',
-        sourcePath: '/messages',
-        targetPath: '/responses',
-        buildPayload: buildOpenAIResponsesPayload,
-        responseToSource: openAIResponsesToAnthropic,
-        streamToSource: streamOpenAIResponsesToAnthropic,
-        writeSourceAsSse: writeAnthropicMessageAsSse,
-      };
-    case 'openai|openai_response':
-      return {
-        source: 'openai',
-        target: 'openai_response',
-        sourcePath: '/chat/completions',
-        targetPath: '/responses',
-        buildPayload: buildOpenAIResponsesPayloadFromChatCompletion,
-        responseToSource: openAIResponsesToChatCompletion,
-        writeSourceAsSse: writeChatCompletionAsSse,
-        forceNonStreamingUpstream: true,
-      };
-    case 'openai_response|openai':
-      return {
-        source: 'openai_response',
-        target: 'openai',
-        sourcePath: '/responses',
-        targetPath: '/chat/completions',
-        buildPayload: buildOpenAIChatCompletionPayloadFromResponses,
-        responseToSource: openAIChatCompletionToResponses,
-        streamToSource: streamOpenAIChatCompletionToResponses,
-        writeSourceAsSse: writeResponsesAsSse,
-        chatCompletionDialect: 'auto',
-      };
-    case 'openai|openai':
-      return {
-        source: 'openai',
-        target: 'openai',
-        sourcePath: '/chat/completions',
-        targetPath: '/chat/completions',
-        buildPayload: fixOpenAIChatCompletionPayload,
-        responseToSource: (res) => res,
-        streamToSource: streamOpenAIChatCompletionToOpenAI,
-        writeSourceAsSse: writeChatCompletionAsSse,
-      };
-    default:
-      return null;
-  }
+  return getAdaptor(source, target);
 }
 
 function getOpenAIThinkingMode(route, config) {
@@ -450,6 +594,23 @@ function shouldRetryChatCompletionDialect(response, responseBody, dialectIndex, 
   return responseBodyContainsToolDialectError(responseBody);
 }
 
+function responseBodyContainsReasoningPassbackError(responseBody) {
+  const text = summarizeResponseBody(responseBody, 4000).toLowerCase();
+  return text.includes('reasoning_content')
+    && (text.includes('must be passed back') || text.includes('passed back to the api'));
+}
+
+function buildReasoningDisabledPayload(payload) {
+  const next = { ...(payload || {}) };
+  next.reasoning_effort = 'none';
+  if (next.thinking && typeof next.thinking === 'object') {
+    next.thinking = { ...next.thinking, type: 'disabled' };
+  } else {
+    next.thinking = { type: 'disabled' };
+  }
+  return next;
+}
+
 async function handleTranslatedMessagesRequest(req, res, route, config, targetPath, translationSpec) {
   const requestTokens = estimateTokensFromBody(req.body || {});
   // Responses API branch does not preserve reasoning compatibility by design.
@@ -465,10 +626,18 @@ async function handleTranslatedMessagesRequest(req, res, route, config, targetPa
   const controller = new AbortController();
   attachAbortHandlers(req, res, controller);
 
+  // Allow adaptor to pre-process request (e.g., strip billing headers)
+  const { body: cleanBody, headers: cleanHeaders } = translationSpec.preprocessRequest(req.body || {}, req.headers);
+  if (translationSpec.source === 'openai' && translationSpec.target === 'openai_fix') {
+    console.log(
+      `${formatRequestPrefix(req)} OPENAI_FIX PRE strategy=${OPENAI_FIX_STRATEGY} ${summarizeThinkingFlags(cleanBody)} ${summarizeAssistantReasoning(cleanBody?.messages)}`,
+    );
+  }
+
   try {
     for (let dialectIndex = 0; dialectIndex < dialects.length; dialectIndex += 1) {
       const chatCompletionDialect = dialects[dialectIndex];
-      const payload = translationSpec.buildPayload(req.body || {}, {
+      const payload = translationSpec.buildPayload(cleanBody, {
         model: config.openaiModel || undefined,
         thinkingMode: getOpenAIThinkingMode(route, config),
         preserveReasoningContent,
@@ -476,23 +645,95 @@ async function handleTranslatedMessagesRequest(req, res, route, config, targetPa
         chatCompletionDialect,
         toolChoiceMode: getOpenAIChatCompletionToolChoiceMode(route, config),
       });
-      const headers = buildOpenAIHeaders(req.headers, config, {
+      const headers = buildOpenAIHeaders(cleanHeaders, config, {
         accept: payload.stream ? 'text/event-stream' : 'application/json',
       });
+      if (translationSpec.source === 'openai' && translationSpec.target === 'openai_fix') {
+        console.log(
+          `${formatRequestPrefix(req)} OPENAI_FIX OUT strategy=${OPENAI_FIX_STRATEGY} ${summarizeThinkingFlags(payload)} ${summarizeAssistantReasoning(payload?.messages)}`,
+        );
+      }
 
-      const response = await fetch(targetUrl, {
-        method: 'POST',
-        headers,
-        body: JSON.stringify(payload),
-        signal: controller.signal,
-      });
-      const responseContentType = response.headers.get('content-type') || '';
+      let response;
+      let responseBody;
+      let responseContentType;
       const dialectNote = chatCompletionDialect ? ` dialect=${chatCompletionDialect}` : '';
-      console.log(`[Translate] Response -> ${response.status} (${responseContentType})${dialectNote}`);
+
+      for (let retry = 0; retry <= 2; retry += 1) {
+        response = await fetch(targetUrl, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify(payload),
+          signal: controller.signal,
+        });
+        responseContentType = response.headers.get('content-type') || '';
+        const retryNote = retry > 0 ? ` (retry ${retry}/2)` : '';
+        console.log(`[Translate] Response -> ${response.status} (${responseContentType})${dialectNote}${retryNote}`);
+
+        if (response.ok) {
+          responseBody = undefined;
+          break;
+        }
+
+        responseBody = await fetchJsonOrText(response);
+
+        // Retry on 402 (Insufficient Balance) up to 2 times
+        if (response.status === 402 && retry < 2) {
+          console.warn(`[Retry 402] ${req.method} ${req.originalUrl} -> ${targetUrl}: retrying (attempt ${retry + 1}/2)`);
+          await new Promise((resolve) => setTimeout(resolve, 1000));
+          continue;
+        }
+
+        break;
+      }
 
       if (!response.ok) {
-        const responseBody = await fetchJsonOrText(response);
+        if (
+          translationSpec.source === 'openai'
+          && translationSpec.target === 'openai_fix'
+          && response?.status === 400
+          && responseBodyContainsReasoningPassbackError(responseBody)
+        ) {
+          const downgradedPayload = buildReasoningDisabledPayload(payload);
+          console.warn(
+            `${formatRequestPrefix(req)} OPENAI_FIX RETRY reasoning-passback -> disable-thinking`,
+          );
+          const retryResponse = await fetch(targetUrl, {
+            method: 'POST',
+            headers,
+            body: JSON.stringify(downgradedPayload),
+            signal: controller.signal,
+          });
+          const retryContentType = retryResponse.headers.get('content-type') || '';
+          console.log(`[Translate] Response -> ${retryResponse.status} (${retryContentType}) reasoning-fallback`);
+          if (retryResponse.ok) {
+            if (getConfiguredChatCompletionDialect(translationSpec, config) === 'auto') {
+              rememberChatCompletionDialect(dialectCacheKey, config, chatCompletionDialect);
+            }
+            return handleTranslatedMessagesResponse(
+              req,
+              res,
+              route,
+              targetPath,
+              translationSpec,
+              retryResponse,
+              retryContentType,
+              downgradedPayload,
+              requestTokens,
+              preserveReasoningContent,
+            );
+          }
+          response = retryResponse;
+          responseContentType = retryContentType;
+          responseBody = await fetchJsonOrText(retryResponse);
+        }
+
         console.error(`[Translate Error Body] ${req.method} ${req.originalUrl} -> ${targetUrl}: ${summarizeResponseBody(responseBody)}${dialectNote}`);
+        if (translationSpec.source === 'openai' && translationSpec.target === 'openai_fix') {
+          console.error(
+            `${formatRequestPrefix(req)} OPENAI_FIX ERR strategy=${OPENAI_FIX_STRATEGY} ${summarizeThinkingFlags(payload)} ${summarizeAssistantReasoning(payload?.messages)}`,
+          );
+        }
         logTranslatedTokenStats(req, route, targetPath, requestTokens, payload, null, `status=${response.status}${dialectNote}`);
 
         if (shouldRetryChatCompletionDialect(response, responseBody, dialectIndex, dialects)) {
@@ -513,7 +754,18 @@ async function handleTranslatedMessagesRequest(req, res, route, config, targetPa
         rememberChatCompletionDialect(dialectCacheKey, config, chatCompletionDialect);
       }
 
-      return handleTranslatedMessagesResponse(req, res, route, targetPath, translationSpec, response, responseContentType, payload, requestTokens, preserveReasoningContent);
+      return handleTranslatedMessagesResponse(
+        req,
+        res,
+        route,
+        targetPath,
+        translationSpec,
+        response,
+        responseContentType,
+        payload,
+        requestTokens,
+        preserveReasoningContent,
+      );
     }
   } catch (error) {
     if (error?.name === 'AbortError' || /aborted/i.test(error?.message || '')) {
@@ -738,6 +990,9 @@ function createApp(config = getConfig()) {
   app.set('proxyConfig', config);
 
   app.use((req, res, next) => {
+    const meta = getRequestMeta(req);
+    res.setHeader('x-local-proxy-request-id', meta.id);
+
     if (req.path === '/' && req.method === 'GET') {
       res.status(200).json({
         name: 'local-claude-desktop-proxy',
@@ -765,11 +1020,23 @@ function createApp(config = getConfig()) {
       return;
     }
 
+    const route = req.proxyRoute;
+    const targetUrl = buildTargetUrl(route, route.upstreamPath, '');
+    console.log(`${formatRequestPrefix(req)} IN ${req.method} ${req.originalUrl} -> ${targetUrl}${route.search || ''}${route.hasTranslation ? ` translate=${route.translation?.source}|${route.translation?.target}` : ''}`);
+
     next();
   });
 
   app.use(bodyParser.json({ limit: config.bodyLimit }));
   app.use(bodyParser.urlencoded({ limit: config.bodyLimit, extended: true }));
+
+  app.use((req, res, next) => {
+    const meta = getRequestMeta(req);
+    meta.bodySummary = summarizeRequestBody(req.body);
+    meta.fingerprint = buildBodyFingerprint(req.body);
+    console.log(`${formatRequestPrefix(req)} BODY ${meta.bodySummary} fp=${meta.fingerprint}`);
+    next();
+  });
 
   app.use((req, res, next) => {
     if (req.body && req.body.model) {
@@ -782,6 +1049,63 @@ function createApp(config = getConfig()) {
       }
     }
     next();
+  });
+
+  app.use((req, res, next) => {
+    if (req.method !== 'POST' || !req.body || typeof req.body !== 'object') {
+      return next();
+    }
+
+    const normalizedPath = normalizePathname(req.proxyRoute?.upstreamPath);
+    if (!splitPathTail(normalizedPath, '/responses')) {
+      return next();
+    }
+
+    const fixedBody = fixOpenAIResponsesPayload(req.body);
+    const analysisBefore = analyzeOpenAIResponsesPayload(req.body);
+    const analysisAfter = analyzeOpenAIResponsesPayload(fixedBody);
+    if (fixedBody !== req.body) {
+      req.body = fixedBody;
+      console.log(`${formatRequestPrefix(req)} FIX-RESPONSES normalized=true types.before=${summarizeResponsesContentTypeCounts(analysisBefore.contentTypeCounts)} types.after=${summarizeResponsesContentTypeCounts(analysisAfter.contentTypeCounts)} issues.before=${analysisBefore.issues.length} issues.after=${analysisAfter.issues.length}`);
+    } else if (analysisBefore.issues.length > 0) {
+      console.warn(`${formatRequestPrefix(req)} FIX-RESPONSES normalized=false issues=${analysisBefore.issues.length} types=${summarizeResponsesContentTypeCounts(analysisBefore.contentTypeCounts)} detail=${summarizeResponsesIssues(analysisBefore.issues)}`);
+    }
+
+    if (analysisAfter.issues.length > 0) {
+      console.warn(`${formatRequestPrefix(req)} RESPONSES-PREFLIGHT issues=${analysisAfter.issues.length} detail=${summarizeResponsesIssues(analysisAfter.issues)}`);
+    }
+
+    return next();
+  });
+
+  app.use((req, res, next) => {
+    if (req.method !== 'POST' || !req.body || typeof req.body !== 'object') {
+      return next();
+    }
+
+    const route = req.proxyRoute;
+    if (route?.hasTranslation) {
+      return next();
+    }
+
+    const normalizedPath = normalizePathname(route?.upstreamPath);
+    if (!splitPathTail(normalizedPath, '/chat/completions')) {
+      return next();
+    }
+
+    const beforeSummary = summarizeAssistantReasoning(req.body?.messages);
+    const beforeThinking = summarizeThinkingFlags(req.body);
+    const fixedBody = fixOpenAIChatCompletionPayload(req.body);
+    const afterSummary = summarizeAssistantReasoning(fixedBody?.messages);
+    const afterThinking = summarizeThinkingFlags(fixedBody);
+    if (fixedBody !== req.body) {
+      req.body = fixedBody;
+      console.log(`${formatRequestPrefix(req)} FIX-CHAT-COMPLETION strategy=${OPENAI_FIX_STRATEGY} restored=true before{${beforeThinking};${beforeSummary}} after{${afterThinking};${afterSummary}}`);
+    } else {
+      console.log(`${formatRequestPrefix(req)} FIX-CHAT-COMPLETION strategy=${OPENAI_FIX_STRATEGY} restored=false state{${beforeThinking};${beforeSummary}}`);
+    }
+
+    return next();
   });
 
   app.use((req, res, next) => {
@@ -806,16 +1130,34 @@ function createApp(config = getConfig()) {
     },
     changeOrigin: true,
     ws: true,
+    timeout: config.proxyTimeoutMs > 0 ? config.proxyTimeoutMs : undefined,
+    proxyTimeout: config.upstreamTimeoutMs > 0 ? config.upstreamTimeoutMs : undefined,
     on: {
       proxyReq: (proxyReq, req) => {
+        const meta = getRequestMeta(req);
+        meta.targetStartedAt = Date.now();
+
+        if (!proxyReq.getHeader('x-proxy-request-id') && !proxyReq.headersSent) {
+          proxyReq.setHeader('x-proxy-request-id', meta.id);
+        }
+
         if (req.body && typeof req.body === 'object' && Object.keys(req.body).length > 0) {
           proxyReq.removeHeader('transfer-encoding');
           fixRequestBody(proxyReq, req);
         }
-        console.log(`[Proxy] ${req.method} ${proxyReq.protocol}//${proxyReq.host}${proxyReq.path}`);
+
+        const accept = req.headers?.accept || '';
+        const contentType = req.headers?.['content-type'] || '';
+        console.log(`${formatRequestPrefix(req)} PROXY-> ${req.method} ${proxyReq.protocol}//${proxyReq.host}${proxyReq.path} accept=${accept || '-'} content-type=${contentType || '-'} fp=${meta.fingerprint}`);
       },
       proxyRes: (proxyRes, req) => {
-        console.log(`[Proxy] Response -> Status: ${proxyRes.statusCode}`);
+        const elapsedMs = getElapsedMs(req);
+        const upstreamElapsedMs = getElapsedMs(req, 'targetStartedAt');
+        const contentType = proxyRes.headers?.['content-type'] || '-';
+        const server = proxyRes.headers?.server || '-';
+        const cfRay = proxyRes.headers?.['cf-ray'] || '-';
+        const cacheStatus = proxyRes.headers?.['cf-cache-status'] || '-';
+        console.log(`${formatRequestPrefix(req)} PROXY<- status=${proxyRes.statusCode} total=${elapsedMs}ms upstream=${upstreamElapsedMs}ms content-type=${contentType} server=${server} cf-ray=${cfRay} cf-cache=${cacheStatus}`);
         if (proxyRes.statusCode >= 400) {
           const body = [];
           proxyRes.on('data', (chunk) => {
@@ -823,12 +1165,14 @@ function createApp(config = getConfig()) {
           });
           proxyRes.on('end', () => {
             const errorBody = Buffer.concat(body).toString();
-            console.error(`[Error Body from Target] Status ${proxyRes.statusCode}: ${errorBody}`);
+            console.error(`${formatRequestPrefix(req)} TARGET-ERROR status=${proxyRes.statusCode} body=${errorBody}`);
           });
         }
       },
       error: (err, req, res) => {
-        console.error(`[Proxy Error] ${err.message}`);
+        const elapsedMs = getElapsedMs(req);
+        const upstreamElapsedMs = getElapsedMs(req, 'targetStartedAt');
+        console.error(`${formatRequestPrefix(req)} PROXY-ERROR total=${elapsedMs}ms upstream=${upstreamElapsedMs}ms ${err.message}`);
         if (!res.headersSent) {
           res.status(500).json({
             error: 'Proxy Error',
@@ -860,6 +1204,8 @@ function startServer(config = getConfig()) {
     console.log('Local Claude Desktop Proxy is running');
     console.log(`Listening on: http://localhost:${config.port}`);
     console.log(`Body limit: ${config.bodyLimit}`);
+    console.log(`Proxy timeout (client): ${config.proxyTimeoutMs > 0 ? `${config.proxyTimeoutMs}ms` : 'disabled'}`);
+    console.log(`Proxy timeout (upstream): ${config.upstreamTimeoutMs > 0 ? `${config.upstreamTimeoutMs}ms` : 'disabled'}`);
     console.log('Direct routing: /<host>/<path> or /s/<host>/<path>');
     console.log('Translated routing: /<host>/<base>/$anthropic|openai|openai_response or $openai|openai_response or $openai_response|openai/<path>');
     console.log('-----------------------------------------');
@@ -868,8 +1214,10 @@ function startServer(config = getConfig()) {
 }
 
 module.exports = {
-  createApp,
+  adaptorRegistry,
   clearCachedChatCompletionDialect,
+  createApp,
+  getAdaptor,
   getCachedChatCompletionDialect,
   getChatCompletionDialectSequence,
   openAIChatCompletionDialectCache,
