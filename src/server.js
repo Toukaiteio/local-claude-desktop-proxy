@@ -1185,8 +1185,8 @@ function createApp(config = getConfig()) {
       }
 
       res.status(proxyRes.status);
-      const buffer = await proxyRes.buffer();
-      res.end(buffer);
+      const buffer = await proxyRes.arrayBuffer();
+      res.end(Buffer.from(buffer));
       return;
     }
   });
