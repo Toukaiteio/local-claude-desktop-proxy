@@ -391,11 +391,11 @@ async function handleTranslatedHeadRequest(req, res, route, config) {
   attachAbortHandlers(req, res, controller);
 
   try {
-    const response = await fetch(targetUrl, {
+    const response = await fetchWithRetry(targetUrl, {
       method: 'HEAD',
       headers,
       signal: controller.signal,
-    });
+    }, ` HEAD ${targetUrl}`);
 
     const responseContentType = response.headers.get('content-type') || '';
     console.log(`[Translate] HEAD ${targetUrl} -> ${response.status} (${responseContentType})`);
@@ -413,6 +413,27 @@ async function handleTranslatedHeadRequest(req, res, route, config) {
     }
 
     res.status(502).end();
+  }
+}
+
+/**
+ * Wrapper for fetch with automatic 402 retry logic.
+ * Retries up to 2 times on 402 (Insufficient Balance) with 1s delay between attempts.
+ * @param {string} url - Request URL
+ * @param {object} options - Fetch options
+ * @param {string} [logContext] - Optional context for logging
+ * @returns {Promise<Response>} Fetch response
+ */
+async function fetchWithRetry(url, options, logContext = '') {
+  for (let retry = 0; retry <= 2; retry += 1) {
+    const response = await fetch(url, options);
+    
+    if (response.ok || response.status !== 402 || retry >= 2) {
+      return response;
+    }
+
+    console.warn(`[Retry 402]${logContext} retrying (attempt ${retry + 1}/2)`);
+    await new Promise((resolve) => setTimeout(resolve, 1000));
   }
 }
 
@@ -659,32 +680,19 @@ async function handleTranslatedMessagesRequest(req, res, route, config, targetPa
       let responseContentType;
       const dialectNote = chatCompletionDialect ? ` dialect=${chatCompletionDialect}` : '';
 
-      for (let retry = 0; retry <= 2; retry += 1) {
-        response = await fetch(targetUrl, {
-          method: 'POST',
-          headers,
-          body: JSON.stringify(payload),
-          signal: controller.signal,
-        });
-        responseContentType = response.headers.get('content-type') || '';
-        const retryNote = retry > 0 ? ` (retry ${retry}/2)` : '';
-        console.log(`[Translate] Response -> ${response.status} (${responseContentType})${dialectNote}${retryNote}`);
+      response = await fetchWithRetry(targetUrl, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(payload),
+        signal: controller.signal,
+      }, ` POST ${targetUrl}${dialectNote}`);
+      responseContentType = response.headers.get('content-type') || '';
+      console.log(`[Translate] Response -> ${response.status} (${responseContentType})${dialectNote}`);
 
-        if (response.ok) {
-          responseBody = undefined;
-          break;
-        }
-
+      if (!response.ok) {
         responseBody = await fetchJsonOrText(response);
-
-        // Retry on 402 (Insufficient Balance) up to 2 times
-        if (response.status === 402 && retry < 2) {
-          console.warn(`[Retry 402] ${req.method} ${req.originalUrl} -> ${targetUrl}: retrying (attempt ${retry + 1}/2)`);
-          await new Promise((resolve) => setTimeout(resolve, 1000));
-          continue;
-        }
-
-        break;
+      } else {
+        responseBody = undefined;
       }
 
       if (!response.ok) {
@@ -698,12 +706,12 @@ async function handleTranslatedMessagesRequest(req, res, route, config, targetPa
           console.warn(
             `${formatRequestPrefix(req)} OPENAI_FIX RETRY reasoning-passback -> disable-thinking`,
           );
-          const retryResponse = await fetch(targetUrl, {
+          const retryResponse = await fetchWithRetry(targetUrl, {
             method: 'POST',
             headers,
             body: JSON.stringify(downgradedPayload),
             signal: controller.signal,
-          });
+          }, ` POST ${targetUrl} (reasoning-fallback)`);
           const retryContentType = retryResponse.headers.get('content-type') || '';
           console.log(`[Translate] Response -> ${retryResponse.status} (${retryContentType}) reasoning-fallback`);
           if (retryResponse.ok) {
@@ -867,11 +875,11 @@ async function handleTranslatedModelsRequest(req, res, route, config, targetPath
   attachAbortHandlers(req, res, controller);
 
   try {
-    const response = await fetch(targetUrl, {
+    const response = await fetchWithRetry(targetUrl, {
       method: 'GET',
       headers,
       signal: controller.signal,
-    });
+    }, ` GET ${targetUrl}`);
     const responseContentType = response.headers.get('content-type') || '';
     console.log(`[Translate] Response -> ${response.status} (${responseContentType})`);
 
