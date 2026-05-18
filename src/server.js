@@ -1125,6 +1125,73 @@ function createApp(config = getConfig()) {
 
   app.use(handleTranslationMiddleware);
 
+  // Direct proxy with 402 retry support
+  app.use(async (req, res, next) => {
+    const route = req.proxyRoute || parseProxyRequestUrl(req.originalUrl);
+    if (!route) {
+      return next();
+    }
+
+    const meta = getRequestMeta(req);
+    const targetUrl = `${route.scheme}://${route.host}${route.upstreamPath}${route.search || ''}`;
+    const accept = req.headers?.accept || '';
+    const contentType = req.headers?.['content-type'] || '';
+    console.log(`${formatRequestPrefix(req)} PROXY-> ${req.method} ${targetUrl} accept=${accept || '-'} content-type=${contentType || '-'} fp=${meta.fingerprint}`);
+
+    const headers = { ...req.headers };
+    if (!headers['x-proxy-request-id']) {
+      headers['x-proxy-request-id'] = meta.id;
+    }
+    delete headers.host;
+
+    let body;
+    if (req.body && typeof req.body === 'object' && Object.keys(req.body).length > 0) {
+      body = JSON.stringify(req.body);
+    }
+
+    for (let retry = 0; retry <= 2; retry += 1) {
+      meta.targetStartedAt = Date.now();
+      const proxyRes = await fetch(targetUrl, {
+        method: req.method,
+        headers,
+        body,
+      });
+
+      const elapsedMs = getElapsedMs(req);
+      const upstreamElapsedMs = getElapsedMs(req, 'targetStartedAt');
+      const resContentType = proxyRes.headers.get('content-type') || '-';
+      const server = proxyRes.headers.get('server') || '-';
+      const cfRay = proxyRes.headers.get('cf-ray') || '-';
+      const cacheStatus = proxyRes.headers.get('cf-cache-status') || '-';
+      const retryNote = retry > 0 ? ` (retry ${retry}/2)` : '';
+      console.log(`${formatRequestPrefix(req)} PROXY<- status=${proxyRes.status} total=${elapsedMs}ms upstream=${upstreamElapsedMs}ms content-type=${resContentType} server=${server} cf-ray=${cfRay} cf-cache=${cacheStatus}${retryNote}`);
+
+      if (proxyRes.status === 402 && retry < 2) {
+        console.warn(`[Retry 402] ${req.method} ${req.originalUrl} -> ${targetUrl}: retrying (attempt ${retry + 1}/2)`);
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+        continue;
+      }
+
+      if (proxyRes.status >= 400) {
+        const errorBody = await proxyRes.text();
+        console.error(`${formatRequestPrefix(req)} TARGET-ERROR status=${proxyRes.status} body=${errorBody}`);
+      }
+
+      // Copy response headers
+      for (const [key, value] of proxyRes.headers) {
+        if (!['content-encoding', 'transfer-encoding'].includes(key.toLowerCase())) {
+          res.setHeader(key, value);
+        }
+      }
+
+      res.status(proxyRes.status);
+      const buffer = await proxyRes.buffer();
+      res.end(buffer);
+      return;
+    }
+  });
+
+  // WebSocket support via http-proxy-middleware
   app.use('/', createProxyMiddleware({
     target: 'http://placeholder.invalid',
     router: (req) => {
@@ -1140,55 +1207,6 @@ function createApp(config = getConfig()) {
     ws: true,
     timeout: config.proxyTimeoutMs > 0 ? config.proxyTimeoutMs : undefined,
     proxyTimeout: config.upstreamTimeoutMs > 0 ? config.upstreamTimeoutMs : undefined,
-    on: {
-      proxyReq: (proxyReq, req) => {
-        const meta = getRequestMeta(req);
-        meta.targetStartedAt = Date.now();
-
-        if (!proxyReq.getHeader('x-proxy-request-id') && !proxyReq.headersSent) {
-          proxyReq.setHeader('x-proxy-request-id', meta.id);
-        }
-
-        if (req.body && typeof req.body === 'object' && Object.keys(req.body).length > 0) {
-          proxyReq.removeHeader('transfer-encoding');
-          fixRequestBody(proxyReq, req);
-        }
-
-        const accept = req.headers?.accept || '';
-        const contentType = req.headers?.['content-type'] || '';
-        console.log(`${formatRequestPrefix(req)} PROXY-> ${req.method} ${proxyReq.protocol}//${proxyReq.host}${proxyReq.path} accept=${accept || '-'} content-type=${contentType || '-'} fp=${meta.fingerprint}`);
-      },
-      proxyRes: (proxyRes, req) => {
-        const elapsedMs = getElapsedMs(req);
-        const upstreamElapsedMs = getElapsedMs(req, 'targetStartedAt');
-        const contentType = proxyRes.headers?.['content-type'] || '-';
-        const server = proxyRes.headers?.server || '-';
-        const cfRay = proxyRes.headers?.['cf-ray'] || '-';
-        const cacheStatus = proxyRes.headers?.['cf-cache-status'] || '-';
-        console.log(`${formatRequestPrefix(req)} PROXY<- status=${proxyRes.statusCode} total=${elapsedMs}ms upstream=${upstreamElapsedMs}ms content-type=${contentType} server=${server} cf-ray=${cfRay} cf-cache=${cacheStatus}`);
-        if (proxyRes.statusCode >= 400) {
-          const body = [];
-          proxyRes.on('data', (chunk) => {
-            body.push(chunk);
-          });
-          proxyRes.on('end', () => {
-            const errorBody = Buffer.concat(body).toString();
-            console.error(`${formatRequestPrefix(req)} TARGET-ERROR status=${proxyRes.statusCode} body=${errorBody}`);
-          });
-        }
-      },
-      error: (err, req, res) => {
-        const elapsedMs = getElapsedMs(req);
-        const upstreamElapsedMs = getElapsedMs(req, 'targetStartedAt');
-        console.error(`${formatRequestPrefix(req)} PROXY-ERROR total=${elapsedMs}ms upstream=${upstreamElapsedMs}ms ${err.message}`);
-        if (!res.headersSent) {
-          res.status(500).json({
-            error: 'Proxy Error',
-            message: err.message,
-          });
-        }
-      },
-    },
   }));
 
   app.use((err, req, res, next) => {
