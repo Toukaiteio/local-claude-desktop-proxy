@@ -10,10 +10,6 @@ const {
   toIsoTimestamp,
 } = require('./utils');
 
-const {
-  openAIChatCompletionDialectCache,
-  rememberChatCompletionDialect,
-} = require('../server'); // This might cause circular dependency if not careful, let's check
 const { recordReasoning } = require('./openai-fixer');
 
 function normalizeCreatedAt(value) {

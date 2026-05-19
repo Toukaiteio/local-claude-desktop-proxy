@@ -1,4 +1,5 @@
 const DEFAULT_BODY_LIMIT = '256mb';
+const DEFAULT_FORWARD_RULES_FILE = 'forward-rules.local.js';
 const DEFAULT_HEAD_MODE = 'ack';
 const DEFAULT_OPENAI_API_KEY = '';
 const DEFAULT_OPENAI_MODEL = '';
@@ -79,6 +80,7 @@ function getConfig(env = process.env) {
   return {
     port: parsePort(getEnvValue(env, 'PORT'), DEFAULT_PORT),
     bodyLimit: getEnvValue(env, 'BODY_LIMIT') || getEnvValue(env, 'MAX_BODY_SIZE') || DEFAULT_BODY_LIMIT,
+    forwardRulesFile: getEnvValue(env, 'FORWARD_RULES_FILE') || DEFAULT_FORWARD_RULES_FILE,
     openaiApiKey: getEnvValue(env, 'OPENAI_API_KEY') || DEFAULT_OPENAI_API_KEY,
     openaiModel: getEnvValue(env, 'OPENAI_MODEL') || DEFAULT_OPENAI_MODEL,
     openaiChatCompletionDialect: parseOpenAIChatCompletionDialect(
@@ -109,6 +111,7 @@ function getConfig(env = process.env) {
 
 module.exports = {
   DEFAULT_BODY_LIMIT,
+  DEFAULT_FORWARD_RULES_FILE,
   DEFAULT_HEAD_MODE,
   DEFAULT_OPENAI_API_KEY,
   DEFAULT_OPENAI_CHAT_COMPLETION_DIALECT,

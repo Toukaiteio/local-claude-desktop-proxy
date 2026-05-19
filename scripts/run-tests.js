@@ -1570,6 +1570,7 @@ test('parses a simple SSE stream', async () => {
 });
 
 const { runRewriteTests } = require('../test/rewrite.test');
+const { runForwardRuleTests } = require('../test/forward-rules.test');
 
 test('fixOpenAIChatCompletionPayload: basic extraction', () => {
   const payload = {
@@ -1762,6 +1763,15 @@ async function main() {
     runRewriteTests();
   } catch (error) {
     console.error('rewriteModelName tests failed!');
+    console.error(error);
+    process.exitCode = 1;
+    return;
+  }
+
+  try {
+    runForwardRuleTests();
+  } catch (error) {
+    console.error('forward rule tests failed!');
     console.error(error);
     process.exitCode = 1;
     return;
