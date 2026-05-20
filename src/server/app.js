@@ -115,12 +115,13 @@ function createApp(config = getConfig()) {
       req.body = resolved.body;
     }
 
-    if (resolved.changes.url || resolved.changes.model || resolved.changes.protocol) {
+    if (resolved.changes.url || resolved.changes.model || resolved.changes.protocol || resolved.changes.tools) {
       const parts = [];
       if (resolved.changes.url) parts.push(`url: ${resolved.original.url} -> ${resolved.rewritten.url}`);
       if (resolved.changes.baseUrl) parts.push(`baseUrl: ${resolved.original.baseUrl} -> ${resolved.rewritten.baseUrl}`);
       if (resolved.changes.model) parts.push(`model: ${resolved.original.model} -> ${resolved.rewritten.model}`);
       if (resolved.changes.protocol) parts.push(`protocol: ${resolved.original.protocol} -> ${resolved.rewritten.protocol}`);
+      if (resolved.changes.tools) parts.push('tools: [modified]');
       if (resolved.apiKey) parts.push('apiKey: [overridden]');
 
       console.log(
@@ -224,13 +225,36 @@ function createApp(config = getConfig()) {
       body = JSON.stringify(req.body);
     }
 
+    const controller = new AbortController();
+    const abort = () => {
+      if (!controller.signal.aborted) {
+        controller.abort();
+      }
+    };
+    req.once('aborted', abort);
+    res.once('close', () => {
+      if (!res.writableEnded) {
+        abort();
+      }
+    });
+
     for (let retry = 0; retry <= 2; retry += 1) {
       meta.targetStartedAt = Date.now();
-      const proxyRes = await fetch(targetUrl, {
-        method: req.method,
-        headers,
-        body,
-      });
+
+      let proxyRes;
+      try {
+        proxyRes = await fetch(targetUrl, {
+          method: req.method,
+          headers,
+          body,
+          signal: controller.signal,
+        });
+      } catch (err) {
+        if (err?.name === 'AbortError') {
+          return;
+        }
+        throw err;
+      }
 
       const elapsedMs = getElapsedMs(req);
       const upstreamElapsedMs = getElapsedMs(req, 'targetStartedAt');
@@ -270,8 +294,22 @@ function createApp(config = getConfig()) {
       }
 
       res.status(proxyRes.status);
-      const buffer = await proxyRes.arrayBuffer();
-      res.end(Buffer.from(buffer));
+
+      const reader = proxyRes.body.getReader();
+      const decoder = new TextDecoder();
+
+      try {
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          if (res.writableEnded) break;
+          res.write(decoder.decode(value, { stream: true }));
+        }
+      } finally {
+        if (!res.writableEnded) {
+          res.end();
+        }
+      }
       return;
     }
   });

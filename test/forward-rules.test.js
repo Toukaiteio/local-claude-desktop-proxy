@@ -5,9 +5,11 @@ const path = require('path');
 
 const {
   applyForwardRuleSet,
+  applyToolsRewrite,
   ensureForwardRulesFile,
   getRequestProtocol,
   getTargetProtocol,
+  getToolNames,
   loadForwardRules,
   parseBaseUrl,
   resolveForwardedRoute,
@@ -60,10 +62,13 @@ function runForwardRuleTests() {
   assert.deepEqual(matched, {
     url: 'https://api.openai.com/v1/chat/completions',
     baseUrl: 'https://openrouter.ai/api/v1',
+    host: null,
     model: 'gpt-4.1',
     protocol: 'openai_response',
     apiKey: null,
     matchedRuleId: 'rewrite-all',
+    toolNames: [],
+    toolsSpec: null,
   });
 
   const unmatched = applyForwardRuleSet({
@@ -442,6 +447,251 @@ function runForwardRuleTests() {
   });
   assert.equal(openAIResponsesToOpenAIFixScenario.route.upstreamPath, '/v1/responses');
   assert.equal(openAIResponsesToOpenAIFixScenario.route.host, 'example-api.com');
+
+  // --- tool: getToolNames ---
+  assert.deepEqual(getToolNames(null), []);
+  assert.deepEqual(getToolNames({}), []);
+  assert.deepEqual(getToolNames({ tools: [] }), []);
+  // OpenAI Chat format
+  assert.deepEqual(getToolNames({
+    tools: [
+      { type: 'function', function: { name: 'weather' } },
+      { type: 'function', function: { name: 'search' } },
+    ],
+  }), ['weather', 'search']);
+  // Anthropic format
+  assert.deepEqual(getToolNames({
+    tools: [
+      { name: 'calculator', description: 'Calc' },
+      { name: 'weather', description: 'Weather' },
+    ],
+  }), ['calculator', 'weather']);
+  // OpenAI Responses format (flat)
+  assert.deepEqual(getToolNames({
+    tools: [
+      { type: 'function', name: 'search', description: 'Search' },
+    ],
+  }), ['search']);
+  // Deduplication
+  assert.deepEqual(getToolNames({
+    tools: [
+      { name: 'weather' },
+      { name: 'weather' },
+    ],
+  }), ['weather']);
+
+  // --- tool: applyToolsRewrite ---
+  // Remove
+  const removeResult = applyToolsRewrite({
+    tools: [
+      { name: 'weather', description: 'Weather' },
+      { name: 'search', description: 'Search' },
+    ],
+  }, { remove: ['weather'] });
+  assert.equal(removeResult.tools.length, 1);
+  assert.equal(removeResult.tools[0].name, 'search');
+
+  // Remove no-op (name not found)
+  const removeNoop = applyToolsRewrite({
+    tools: [{ name: 'weather' }],
+  }, { remove: ['search'] });
+  assert.equal(removeNoop, removeNoop); // same reference
+
+  // Override
+  const overrideResult = applyToolsRewrite({
+    tools: [{ name: 'weather' }],
+  }, { override: [{ name: 'new-calc', description: 'Replaced' }] });
+  assert.equal(overrideResult.tools.length, 1);
+  assert.equal(overrideResult.tools[0].name, 'new-calc');
+
+  // Replace (OpenAI Chat format)
+  const replaceChatResult = applyToolsRewrite({
+    tools: [
+      { type: 'function', function: { name: 'weather', description: 'Old' } },
+    ],
+  }, { replace: [{ match: 'weather', tool: { type: 'function', function: { name: 'replaced_tool', description: 'New' } } }] });
+  assert.equal(replaceChatResult.tools.length, 1);
+  assert.equal(replaceChatResult.tools[0].function.name, 'replaced_tool');
+
+  // Replace (flat format)
+  const replaceFlatResult = applyToolsRewrite({
+    tools: [{ name: 'weather', description: 'Old' }],
+  }, { replace: [{ match: 'weather', tool: { name: 'replaced_tool', description: 'New' } }] });
+  assert.equal(replaceFlatResult.tools.length, 1);
+  assert.equal(replaceFlatResult.tools[0].name, 'replaced_tool');
+
+  // --- tool: matchesRule with host matching ---
+  const matchHostResult = applyForwardRuleSet({
+    url: 'https://api.aini8.com/v1/responses',
+    baseUrl: 'https://api.aini8.com/v1',
+    host: 'api.aini8.com',
+    model: 'gpt-5.4',
+    protocol: 'openai_response',
+    toolNames: ['image_generation', 'search'],
+  }, [
+    {
+      id: 'remove-image-gen',
+      match: { host: 'api.aini8.com', tool: 'image_generation' },
+      rewrite: {
+        tools: { remove: ['image_generation'] },
+      },
+    },
+  ]);
+  assert.equal(matchHostResult.matchedRuleId, 'remove-image-gen');
+  assert.deepEqual(matchHostResult.toolsSpec, { remove: ['image_generation'] });
+
+  // Host mismatch should not match
+  const matchHostNegative = applyForwardRuleSet({
+    url: 'https://other.com/v1/responses',
+    host: 'other.com',
+    toolNames: ['image_generation'],
+  }, [
+    {
+      match: { host: 'api.aini8.com', tool: 'image_generation' },
+      rewrite: { tools: { remove: ['image_generation'] } },
+    },
+  ]);
+  assert.equal(matchHostNegative.matchedRuleId, null);
+
+  // --- tool: matchesRule with tool matching ---
+  const matchToolResult = applyForwardRuleSet({
+    url: 'https://api.openai.com/v1/chat/completions',
+    baseUrl: 'https://api.openai.com/v1',
+    model: 'gpt-4',
+    protocol: 'openai',
+    toolNames: ['weather', 'search'],
+  }, [
+    {
+      id: 'match-tool',
+      match: { tool: 'weather' },
+      rewrite: {
+        model: { override: 'weather-triggered-model' },
+      },
+    },
+  ]);
+  assert.equal(matchToolResult.model, 'weather-triggered-model');
+  assert.equal(matchToolResult.matchedRuleId, 'match-tool');
+
+  // Tool match negative
+  const matchToolNegative = applyForwardRuleSet({
+    url: 'https://api.openai.com/v1/chat/completions',
+    baseUrl: 'https://api.openai.com/v1',
+    model: 'gpt-4',
+    protocol: 'openai',
+    toolNames: ['weather'],
+  }, [
+    {
+      match: { tool: 'non-existent' },
+      rewrite: { model: { override: 'should-not-match' } },
+    },
+  ]);
+  assert.equal(matchToolNegative.model, 'gpt-4');
+  assert.equal(matchToolNegative.matchedRuleId, null);
+
+  // Match by multiple tools (match.tools)
+  const matchToolsResult = applyForwardRuleSet({
+    url: 'https://api.openai.com/v1/chat/completions',
+    baseUrl: 'https://api.openai.com/v1',
+    model: 'gpt-4',
+    protocol: 'openai',
+    toolNames: ['calculator', 'search'],
+  }, [
+    {
+      id: 'match-tools',
+      match: { tools: ['weather', 'search'] },
+      rewrite: { model: { override: 'tools-triggered' } },
+    },
+  ]);
+  assert.equal(matchToolsResult.model, 'tools-triggered');
+  assert.equal(matchToolsResult.matchedRuleId, 'match-tools');
+
+  // --- tool: resolveForwardedRoute with tool rewrites ---
+  // Remove a tool from the body
+  const toolRemoveScenario = resolveForwardedRoute(
+    {
+      scheme: 'https',
+      host: 'api.openai.com',
+      upstreamPath: '/v1/chat/completions',
+      translation: null,
+      hasTranslation: false,
+      search: '',
+    },
+    {
+      model: 'gpt-4',
+      tools: [
+        { type: 'function', function: { name: 'weather' } },
+        { type: 'function', function: { name: 'search' } },
+      ],
+    },
+    [
+      {
+        id: 'remove-weather-tool',
+        match: { model: 'gpt-4' },
+        rewrite: {
+          tools: { remove: ['weather'] },
+        },
+      },
+    ],
+  );
+  assert.equal(toolRemoveScenario.body.tools.length, 1);
+  assert.equal(toolRemoveScenario.body.tools[0].function.name, 'search');
+  assert.equal(toolRemoveScenario.changes.tools, true);
+
+  // Override all tools
+  const toolOverrideScenario = resolveForwardedRoute(
+    {
+      scheme: 'https',
+      host: 'api.openai.com',
+      upstreamPath: '/v1/chat/completions',
+      translation: null,
+      hasTranslation: false,
+      search: '',
+    },
+    {
+      model: 'gpt-4',
+      tools: [
+        { type: 'function', function: { name: 'weather' } },
+      ],
+    },
+    [
+      {
+        match: { model: 'gpt-4' },
+        rewrite: {
+          tools: { override: [{ type: 'function', function: { name: 'new-tool', description: 'Overridden' } }] },
+        },
+      },
+    ],
+  );
+  assert.equal(toolOverrideScenario.body.tools.length, 1);
+  assert.equal(toolOverrideScenario.body.tools[0].function.name, 'new-tool');
+  assert.equal(toolOverrideScenario.changes.tools, true);
+
+  // No tools change when no matching tool rule
+  const toolNoMatchScenario = resolveForwardedRoute(
+    {
+      scheme: 'https',
+      host: 'api.openai.com',
+      upstreamPath: '/v1/chat/completions',
+      translation: null,
+      hasTranslation: false,
+      search: '',
+    },
+    {
+      model: 'gpt-4',
+      tools: [{ type: 'function', function: { name: 'weather' } }],
+    },
+    [
+      {
+        match: { model: 'non-existent' },
+        rewrite: {
+          tools: { remove: ['weather'] },
+        },
+      },
+    ],
+  );
+  assert.equal(toolNoMatchScenario.body.tools.length, 1);
+  assert.equal(toolNoMatchScenario.body.tools[0].function.name, 'weather');
+  assert.equal(toolNoMatchScenario.changes.tools, false);
 
   console.log('All forward rule tests passed!');
 }

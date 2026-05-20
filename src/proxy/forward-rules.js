@@ -12,24 +12,24 @@ const DEFAULT_FORWARD_RULES_FILE_CONTENT = `'use strict';
  *   {
  *     match: {
  *       url: 'https://api.openai.com/v1/chat/completions',
+ *       host: 'api.openai.com',   // optional: match by host
  *       model: 'claude-3-7-sonnet',
  *       protocol: 'anthropic',
+ *       tool: 'weather',          // optional: match if any tool has this name
+ *       tools: ['weather', 'search'], // optional: match if any listed tool exists
  *     },
  *     rewrite: {
- *       baseUrl: {
- *         override: 'https://api.openai.com/v1',
- *       },
- *       model: {
- *         replace: {
- *           match: 'claude-3-7-sonnet',
- *           replacement: 'gpt-4.1',
- *         },
- *       },
- *       protocol: {
- *         override: 'openai_response',
- *       },
- *       apiKey: {
- *         overrideFromEnv: 'OPENAI_API_KEY',
+ *       baseUrl: { override: 'https://api.openai.com/v1' },
+ *       model: { replace: { match: 'claude-3-7-sonnet', replacement: 'gpt-4.1' } },
+ *       protocol: { override: 'openai_response' },
+ *       apiKey: { overrideFromEnv: 'OPENAI_API_KEY' },
+ *       // Tool modifications (optional, one per rule):
+ *       tools: {
+ *         remove: ['tool-name'],                    // remove tools by name
+ *         // OR
+ *         override: [{ name: 'new-tool', ... }],    // replace all tools
+ *         // OR
+ *         replace: [{ match: 'old', tool: {...} }], // replace specific tool
  *       },
  *     },
  *   },
@@ -69,6 +69,95 @@ function trimTrailingSlash(value) {
 
 function trimLeadingSlash(value) {
   return typeof value === 'string' ? value.replace(/^\/+/, '') : value;
+}
+
+/**
+ * Extract tool names from a request body regardless of protocol format.
+ * Supports Anthropic (body.tools[].name), OpenAI Chat (body.tools[].function.name),
+ * and OpenAI Responses (body.tools[].name flat).
+ * @param {object|null} body
+ * @returns {string[]}
+ */
+function getToolNames(body) {
+  if (!body || typeof body !== 'object' || !Array.isArray(body.tools)) {
+    return [];
+  }
+  const names = new Set();
+  for (const tool of body.tools) {
+    if (!tool || typeof tool !== 'object') continue;
+    // OpenAI Chat: { type: 'function', function: { name } }
+    if (tool.function && typeof tool.function === 'object' && tool.function.name) {
+      names.add(String(tool.function.name));
+      continue;
+    }
+    // Anthropic / Responses (flat): { name }
+    if (tool.name) {
+      names.add(String(tool.name));
+    }
+  }
+  return Array.from(names);
+}
+
+/**
+ * Apply tools rewrite to a request body.
+ * Supports remove, override, and replace operations.
+ * @param {object} body - The request body
+ * @param {object} toolsSpec - Tools rewrite specification
+ * @param {string[]} [toolsSpec.remove] - Tool names to remove
+ * @param {object[]} [toolsSpec.override] - Complete replacement tools array
+ * @param {Array<{match: string, tool: object}>} [toolsSpec.replace] - Tools to replace by name
+ * @returns {object} The (potentially cloned) body with modified tools
+ */
+function applyToolsRewrite(body, toolsSpec) {
+  if (!body || typeof body !== 'object' || !toolsSpec || typeof toolsSpec !== 'object') {
+    return body;
+  }
+  if (!Array.isArray(body.tools) || body.tools.length === 0) {
+    return body;
+  }
+
+  const specKeys = Object.keys(toolsSpec);
+  if (specKeys.length === 0) return body;
+
+  // Use first key to determine operation (remove, override, or replace)
+  const operation = specKeys[0];
+
+  if (operation === 'override') {
+    if (!Array.isArray(toolsSpec.override)) return body;
+    return { ...body, tools: toolsSpec.override };
+  }
+
+  if (operation === 'remove') {
+    const removeNames = Array.isArray(toolsSpec.remove)
+      ? toolsSpec.remove.map(String)
+      : [];
+    if (removeNames.length === 0) return body;
+    const newTools = body.tools.filter((tool) => {
+      const name = tool?.function?.name || tool?.name || '';
+      return !removeNames.includes(name);
+    });
+    if (newTools.length === body.tools.length) return body;
+    return { ...body, tools: newTools };
+  }
+
+  if (operation === 'replace') {
+    const replacements = Array.isArray(toolsSpec.replace) ? toolsSpec.replace : [];
+    if (replacements.length === 0) return body;
+    let changed = false;
+    const newTools = body.tools.map((tool) => {
+      const currentName = tool?.function?.name || tool?.name || '';
+      const match = replacements.find((r) => r.match === currentName);
+      if (match) {
+        changed = true;
+        return match.tool;
+      }
+      return tool;
+    });
+    if (!changed) return body;
+    return { ...body, tools: newTools };
+  }
+
+  return body;
 }
 
 function getRequestProtocol(route) {
@@ -118,7 +207,19 @@ function matchesRule(match, context) {
     return false;
   }
 
+  // Match against tool name(s) in the request body
+  if (match.tool != null) {
+    const names = context.toolNames || [];
+    if (!names.includes(String(match.tool))) return false;
+  }
+  if (match.tools != null) {
+    const names = context.toolNames || [];
+    const toolList = Array.isArray(match.tools) ? match.tools.map(String) : [String(match.tools)];
+    if (!toolList.some((t) => names.includes(t))) return false;
+  }
+
   return matchesValue(match.url, context.url)
+    && matchesValue(match.host, context.host)
     && matchesValue(match.model, context.model)
     && matchesValue(match.provider ?? match.protocol, context.protocol);
 }
@@ -160,10 +261,13 @@ function applyForwardRuleSet(context, rules = [], options = {}) {
   const nextContext = {
     url: context?.url ?? null,
     baseUrl: context?.baseUrl ?? null,
+    host: context?.host ?? null,
     model: context?.model ?? null,
     protocol: context?.protocol ?? null,
     apiKey: context?.apiKey ?? null,
+    toolNames: context?.toolNames ?? [],
     matchedRuleId: null,
+    toolsSpec: null,
   };
 
   for (const rule of rules) {
@@ -184,6 +288,9 @@ function applyForwardRuleSet(context, rules = [], options = {}) {
       options,
     );
     nextContext.apiKey = applyRewriteSpec(nextContext.apiKey, rewrite.apiKey, options);
+    if (rewrite.tools) {
+      nextContext.toolsSpec = rewrite.tools;
+    }
     nextContext.matchedRuleId = rule.id || null;
   }
 
@@ -291,13 +398,16 @@ function resolveForwardedRoute(route, body, rules = [], options = {}) {
   const originalBaseUrl = trimTrailingSlash(buildTargetUrl(route, '', ''));
   const originalPath = route?.upstreamPath || '/';
   const originalModel = typeof body?.model === 'string' ? body.model : null;
+  const originalToolNames = getToolNames(body);
 
   const rewritten = applyForwardRuleSet({
     url: originalFullUrl,
     baseUrl: originalBaseUrl,
+    host: route?.host || null,
     model: originalModel,
     protocol: originalProtocol,
     apiKey: null,
+    toolNames: originalToolNames,
   }, rules, {
     env: options.env || process.env,
   });
@@ -345,6 +455,16 @@ function resolveForwardedRoute(route, body, rules = [], options = {}) {
     nextBody.model = rewritten.model;
   }
 
+  // Apply tools rewrite (remove, replace, or override)
+  let toolsChanged = false;
+  if (rewritten.toolsSpec && nextBody && typeof nextBody === 'object') {
+    const toolsRewrittenBody = applyToolsRewrite(nextBody, rewritten.toolsSpec);
+    if (toolsRewrittenBody !== nextBody) {
+      nextBody.tools = toolsRewrittenBody.tools;
+      toolsChanged = true;
+    }
+  }
+
   return {
     route: nextRoute,
     body: nextBody,
@@ -353,6 +473,7 @@ function resolveForwardedRoute(route, body, rules = [], options = {}) {
       model: nextBody?.model !== originalModel,
       protocol: requestedProtocol !== originalProtocol,
       baseUrl: (rewritten.baseUrl || originalBaseUrl) !== originalBaseUrl,
+      tools: toolsChanged,
     },
     original: {
       url: originalFullUrl,
@@ -366,6 +487,7 @@ function resolveForwardedRoute(route, body, rules = [], options = {}) {
       model: nextBody?.model ?? originalModel,
       protocol: requestedProtocol,
       apiKey: rewritten.apiKey,
+      tools: toolsChanged ? (rewritten.toolsSpec || null) : null,
     },
     apiKey: rewritten.apiKey,
   };
@@ -374,9 +496,11 @@ function resolveForwardedRoute(route, body, rules = [], options = {}) {
 module.exports = {
   DEFAULT_FORWARD_RULES_FILE_CONTENT,
   applyForwardRuleSet,
+  applyToolsRewrite,
   ensureForwardRulesFile,
   getRequestProtocol,
   getTargetProtocol,
+  getToolNames,
   loadForwardRules,
   parseBaseUrl,
   protocolToPathSuffix,

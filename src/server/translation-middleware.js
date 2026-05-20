@@ -58,10 +58,19 @@ function getEffectiveTranslationSpec(route) {
   const source = route?.translation?.source;
   const target = route?.translation?.target;
   const finalTarget = route?.translation?.finalTarget || target;
-  const translationSpec = getTranslationSpec(source, target);
-  const fixSpec = finalTarget === 'openai_fix' && target !== 'openai_fix'
+  let translationSpec = getTranslationSpec(source, target);
+  let fixSpec = finalTarget === 'openai_fix' && target !== 'openai_fix'
     ? getTranslationSpec('openai', 'openai_fix')
     : null;
+
+  // chain: source → openai_fix is not a registered pair,
+  // so decompose into source → openai + openai → openai_fix
+  if (!translationSpec && finalTarget === 'openai_fix') {
+    translationSpec = getTranslationSpec(source, 'openai');
+    if (translationSpec) {
+      fixSpec = getTranslationSpec('openai', 'openai_fix');
+    }
+  }
 
   return {
     finalTarget,
@@ -400,6 +409,11 @@ async function handleTranslationMiddleware(req, res, next) {
     );
   }
   const translationSpec = effective.translationSpec;
+
+  // propagate finalTarget so handleTranslatedMessagesRequest can apply fixSpec
+  if (effective.finalTarget) {
+    route.translation.finalTarget = effective.finalTarget;
+  }
 
   const proxyConfig = req.app.get('proxyConfig') || getConfig();
 
